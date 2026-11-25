@@ -118,8 +118,6 @@ def test_qsa_binding_refreshes_selected_payload_and_resized_workspace(
         "bind",
         lambda plan, **kwargs: SimpleNamespace(version=plan.version, **kwargs),
     )
-    monkeypatch.setattr(attention.paged_kv_write, "Caps", lambda **kwargs: kwargs)
-    monkeypatch.setattr(attention.paged_kv_write, "plan", lambda caps: writer)
     device = torch.device("cpu")
     source = torch.zeros((16, 2560), dtype=torch.bfloat16)
     scratch = attention.QSAScratch.allocate(16, device)
@@ -172,7 +170,8 @@ def test_qsa_binding_refreshes_selected_payload_and_resized_workspace(
     operator.rebind_pages_for_preparation(replacement)
     assert operator.binding.main_k_cache is replacement.main_k_cache
     assert operator.binding.scratch.data_ptr() == grown.data_ptr()
-    assert operator.write_kwargs["k_cache"] is replacement.main_k_cache
+    assert operator.state.main_k_cache is replacement.main_k_cache
+    assert operator.state.main_v_cache is replacement.main_v_cache
     assert (metadata.request_ids == -1).all() and (metadata.slot_mapping == -1).all()
 
 

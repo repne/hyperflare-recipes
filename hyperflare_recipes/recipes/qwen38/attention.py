@@ -11,11 +11,11 @@ from dataclasses import dataclass
 from functools import partial
 
 import torch
-from b12x.attention import paged_kv_write, qsa
+from b12x.attention import qsa
 from b12x.preparation import PreparationSession, PreparedCall
 
 from hyperflare_recipes.components import sm103
-from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope
+from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope_kv_write
 from hyperflare_recipes.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from hyperflare_recipes.components.linear import ParallelProjections, QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.fixtures import qsa as qsa_fixtures
@@ -324,16 +324,6 @@ class PreparedAttention:
             self.binding = qsa.bind(self.plan, scratch=self.workspace, **self.binding_kwargs)
 
         register_finalizer(session, refresh, workspace=workspace)
-        self.writer = paged_kv_write.plan(paged_kv_write.Caps(device=source.device,
-            num_kv_heads=self.kv_heads, head_dim_k=256, head_dim_v=256, page_size=page_size,
-            kv_dtype=state.main_k_cache.dtype))
-        self.write_kwargs = {"key": scratch.key, "value": scratch.projected_v.view(self.tokens, self.kv_heads, 256),
-                             "k_cache": state.main_k_cache, "v_cache": state.main_v_cache,
-                             "slot_mapping": metadata.slot_mapping,
-                             "k_scale": self.binding_kwargs["k_descale"],
-                             "v_scale": self.binding_kwargs["v_descale"]}
-        declare(session, (self.writer.request(name=f"{name}.kv_write", prepare_call=lambda materialized:
-            PreparedCall(run=lambda: materialized.run(**self.write_kwargs))),))
         concurrent = (not cache_only and self.tokens <= 16 and source.is_cuda and isinstance(workspace, ScratchArena)
                       and workspace is projection_workspace
                       and all(isinstance(self.projections[key], QuantizedProjection)
@@ -401,7 +391,6 @@ class PreparedAttention:
         self.binding = qsa.bind(self.plan, scratch=self.workspace, **self.binding_kwargs)
         if self.sharded is not None:
             self.sharded.rebind_pages_for_preparation(state)
-        self.write_kwargs.update(k_cache=state.main_k_cache, v_cache=state.main_v_cache)
         self.state = state
 
     def functional(self, *, session):
@@ -425,26 +414,30 @@ class PreparedAttention:
             if name not in ("main_block_table", "compressed_block_table", "raw_state_slot_ids",
                             "output", "selected_positions")}
         self.scratch = self.metadata = self.index_query = self.index_key = None
-        self.binding = self.binding_kwargs = self.write_kwargs = self.workspace = None
+        self.binding = self.binding_kwargs = self.workspace = None
 
     def _prepare_qkv_runtime(self, projected_qkv: torch.Tensor, metadata):
         q_width = self.q_heads * 512
-        kv_width = self.kv_heads * 256
-        gate = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)[..., 256:]
-        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
-        query, key = qk_head_norm_mrope(
+        gate = None if self.cache_only else projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)[..., 256:]
+        query = qk_head_norm_mrope_kv_write(
             projected_qkv,
-            self.module.q_norm.weight,
+            None if self.cache_only else self.module.q_norm.weight,
             self.module.k_norm.weight,
             metadata.rope_positions,
             self.rotary.cos,
             self.rotary.sin,
+            metadata.slot_mapping,
+            self.state.main_k_cache,
+            self.state.main_v_cache,
             q_heads=self.q_heads,
             kv_heads=self.kv_heads,
             eps=self.module.q_norm.eps,
             zero_centered=self._qk_norm_zero_centered,
+            cache_only=self.cache_only,
         )
-        return query, gate, key, value
+        if query is None:
+            query = torch.empty((self.tokens, self.q_heads, 256), dtype=projected_qkv.dtype, device=projected_qkv.device)
+        return query, gate
 
     def pre_gather_runtime(self, source: torch.Tensor, metadata) -> RowGatherStage:
         """Run local QKV/index projections, KV/compressed cache updates, and row-split selection."""
@@ -452,10 +445,7 @@ class PreparedAttention:
             raise ValueError("pre_gather_runtime requires non-cache-only row-split QSA")
         projected_index = self.projections["indexer.index_qk_proj"](source)
         projected_qkv = self.projections["qkv_proj"](source)
-        query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
-        paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
-            v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
-            k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
+        query, gate = self._prepare_qkv_runtime(projected_qkv, metadata)
         attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
         selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
         bindings = {**self.constants, "main_block_table": metadata.main_block_table,
@@ -508,10 +498,7 @@ class PreparedAttention:
             projection_workspaces = None
         else:
             (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)
-        query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
-        paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
-            v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
-            k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
+        query, gate = self._prepare_qkv_runtime(projected_qkv, metadata)
         if pending_sharded is not None:
             attended, selected = self.sharded.finish_group_selection(
                 pending_sharded, query, metadata, self.workspace_bytes,

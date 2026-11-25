@@ -252,7 +252,7 @@ def _attention_plans(attention, *, is_qsa: bool) -> tuple:
         plans.append(proj.plan)
         plans.append(getattr(proj, "quantizer_plan", None))
     if is_qsa:
-        plans.extend((attention.plan, attention.writer, getattr(attention.sharded, "select_plan", None)))
+        plans.extend((attention.plan, getattr(attention.sharded, "select_plan", None)))
     else:
         plans.extend((
             getattr(attention, "conv_plan", None),
