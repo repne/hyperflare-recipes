@@ -571,7 +571,9 @@ class PreparedGDN:
                 module.norm.variance_epsilon, 128 ** -.5, 0., self.recurrent_plan.handle)
             return gated.view(self.tokens, -1), None
         else:
-            recurrence = torch.zeros((self.tokens, self.value_heads, 128), dtype=torch.bfloat16,
+            # gdn_prefill_out writes every live row [0, num_tokens) and output_norm
+            # masks inactive rows [num_tokens, self.tokens) without reading them.
+            recurrence = torch.empty((self.tokens, self.value_heads, 128), dtype=torch.bfloat16,
                                      device=projected.device)
             q, k, v = convolved.split((self.key_heads * 128, self.key_heads * 128, self.value_heads * 128), dim=-1)
             shape, stride, dtype = self.recurrence_scratch
@@ -585,7 +587,11 @@ class PreparedGDN:
         recurrence = recurrence.view(self.tokens, self.value_heads, 128)
         encoded = None
         if self.encoding_layout:
-            encoded = tuple(torch.empty(shape, dtype=dtype, device=projected.device) if index == 0
+            # Values and ScaleRows are written completely by _gated_rms_norm_mxfp8; ScaleMma
+            # has no padding bytes when rows are 128-aligned (groups = value_heads * 4 is 4-aligned).
+            mma_unpadded = self.tokens % 128 == 0
+            encoded = tuple(torch.empty(shape, dtype=dtype, device=projected.device)
+                            if index < 2 or mma_unpadded
                             else torch.full(shape, 127, dtype=dtype, device=projected.device)
                             for index, (shape, dtype) in enumerate(self.encoding_layout))
         gated = self.output_norm(recurrence, z.view_as(recurrence), encoded_bases=encoded,

@@ -372,15 +372,21 @@ class PreparedDecoderState:
                 inputs.row_generations[:self.rows], inputs.live_rows)
         device = inputs.token_ids.device
         gdn = DeltaMetadata.allocate(self.rows, device)
-        q = QSAMetadata.allocate(tokens=self.tokens, batch=self.rows,
-            context=inputs.page_tables.shape[1] * 64, device=device)
-        qsa = QSAMetadata(q.main_block_table, q.main_block_table, q.raw_state_slot_ids,
-            q.request_ids, q.query_positions, q.rope_positions, q.sequence_lengths,
-            gdn.query_start_loc, gdn.accepted_tokens, q.is_prefilling, q.slot_mapping)
-        qsa.request_ids.fill_(-1)
-        qsa.query_positions.fill_(-1)
-        qsa.rope_positions.fill_(-1)
-        qsa.slot_mapping.fill_(-1)
+        pages = inputs.page_tables.shape[1]
+        block_table = torch.empty((self.rows, pages), dtype=torch.int32, device=device)
+        qsa = QSAMetadata(
+            block_table,
+            block_table,
+            torch.empty((self.rows,), dtype=torch.int64, device=device),
+            torch.full((self.tokens,), -1, dtype=torch.int64, device=device),
+            torch.full((self.tokens,), -1, dtype=torch.int64, device=device),
+            torch.full((self.tokens, 3), -1, dtype=torch.int64, device=device),
+            torch.empty((self.rows,), dtype=torch.int32, device=device),
+            gdn.query_start_loc,
+            gdn.accepted_tokens,
+            torch.empty((self.rows,), dtype=torch.bool, device=device),
+            torch.full((self.tokens,), -1, dtype=torch.int64, device=device),
+        )
         ple = PLEMetadata(inputs.token_ids[:self.tokens], gdn.query_start_loc, history,
             gdn.convolution_slots, gdn.fresh, gdn.accepted_tokens, gdn.num_seqs, gdn.num_tokens)
         values = {f"gdn.{name}": getattr(gdn, name) for name in gdn.__dataclass_fields__}

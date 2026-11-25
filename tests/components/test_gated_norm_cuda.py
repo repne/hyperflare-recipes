@@ -215,3 +215,38 @@ def test_functional_gated_norm_replay_uses_runtime_live_count():
         reference()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert not actual[count:].any()
+
+
+def test_gated_norm_ignores_nan_in_inactive_rows():
+    from hyperflare_recipes.components.gated_norm import PreparedGatedRMSNorm
+    from b12x.quantization import mxfp8
+
+    rows, heads, dim = 128, 4, 128
+    hidden = torch.randn((rows, heads, dim), device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(hidden)
+    weight = torch.randn(dim, device="cuda", dtype=torch.float32)
+    live = torch.tensor([64], dtype=torch.int32, device="cuda")
+    hidden[64:] = float("nan")
+    gate[64:] = float("inf")
+
+    out = torch.empty_like(hidden)
+    norm = PreparedGatedRMSNorm(hidden, gate, weight, out, live, eps=1e-6, round_normalized=True, activation="silu")
+    norm()
+    assert torch.isfinite(out).all()
+    assert not out[64:].any()
+
+    shapes = mxfp8.dense_rows_storage_shapes(rows, heads * dim)
+    bases = (
+        torch.empty(shapes[0], dtype=torch.float8_e4m3fn, device="cuda"),
+        torch.full(shapes[1], 255, dtype=torch.uint8, device="cuda"),
+        torch.full(shapes[2], 255, dtype=torch.uint8, device="cuda"),
+    )
+    encoded = mxfp8.dense_rows_from_bases(*bases)
+    norm_enc = PreparedGatedRMSNorm(
+        hidden, gate, weight, None, live, eps=1e-6, round_normalized=True, activation="silu", encoded=encoded
+    )
+    norm_enc()
+    assert torch.isfinite(encoded.values.float()).all()
+    assert not encoded.values.view(torch.uint8)[64:].any()
+    assert (encoded.scale_rows.view(torch.uint8).reshape(rows, -1)[64:] == 127).all()
+    assert (bases[2] != 255).all()

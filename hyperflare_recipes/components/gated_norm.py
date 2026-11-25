@@ -25,9 +25,11 @@ def _gated_values(Hidden, Gate, Weight, Live, gate_row_stride, EPS: tl.constexpr
     head = tl.program_id(1) * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)[:, None]
     column = tl.arange(0, DIM)[None, :]
     mask = head < HEADS
+    live = row < tl.load(Live)
+    live_mask = mask & live
     offset = row * (HEADS * DIM) + head * DIM + column
-    hidden = tl.load(Hidden + offset, mask=mask, other=0.0).to(tl.float32)
-    gate = tl.load(Gate + row.to(tl.int64) * gate_row_stride + head * DIM + column, mask=mask, other=0.0).to(tl.float32)
+    hidden = tl.load(Hidden + offset, mask=live_mask, other=0.0).to(tl.float32)
+    gate = tl.load(Gate + row.to(tl.int64) * gate_row_stride + head * DIM + column, mask=live_mask, other=0.0).to(tl.float32)
     gate = gate * tl.sigmoid(gate) if SILU_GATE else tl.sigmoid(gate)
     if not NORM_BEFORE_GATE:
         hidden = hidden * gate
@@ -45,7 +47,6 @@ def _gated_values(Hidden, Gate, Weight, Live, gate_row_stride, EPS: tl.constexpr
     else:
         hidden = weight * hidden
     value = hidden * gate if NORM_BEFORE_GATE else hidden
-    live = row < tl.load(Live)
     return offset, mask, tl.where(live, value, 0.0).to(tl.bfloat16)
 
 

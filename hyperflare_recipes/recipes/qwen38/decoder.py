@@ -799,7 +799,7 @@ class PreparedDecoder:
         records = None
         if self.record_layout is not None:
             layers, rows, key_heads, value_heads, width = self.record_layout
-            records = GDNLayerRecords.allocate(layers, rows, embedding.device,
+            records = GDNLayerRecords.empty(layers, rows, embedding.device,
                 key_heads=key_heads, value_heads=value_heads, width=width)
         capture = None if self.context_capture is None else self.context_capture.begin(runtime.capture_metadata)
         if self.pipelined_prefill:

@@ -255,6 +255,18 @@ class GDNLayerRecords:
                    torch.zeros((count, rows, key_heads, width, 128), dtype=torch.float32, device=device),
                    torch.zeros((count, rows, value_heads, width), dtype=torch.float32, device=device))
 
+    @classmethod
+    def empty(cls, layers, rows: int, device, *, key_heads: int, value_heads: int, width: int = WINDOW) -> GDNLayerRecords:
+        """Allocate uninitialized records for traced rounds where verify writes every committed slot."""
+        if type(width) is not int or not 1 <= width <= 16:
+            raise ValueError("GDN record width must be in [1,16]")
+        layers = tuple(layers)
+        count = len(layers)
+        return cls(layers,
+                   torch.empty((count, rows, value_heads, width, 128), dtype=torch.float32, device=device),
+                   torch.empty((count, rows, key_heads, width, 128), dtype=torch.float32, device=device),
+                   torch.empty((count, rows, value_heads, width), dtype=torch.float32, device=device))
+
     def __getitem__(self, layer: int) -> GDNRecords:
         index = self.layers.index(layer)
         return GDNRecords(self.delta[index], self.keys[index], self.decay[index])
