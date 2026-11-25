@@ -94,6 +94,13 @@ class PreparedContextCapture:
         output[:, column:column + hidden.shape[-1]].copy_(values)
         return state
 
+    def write_selected(self, state, values, column):
+        output, _, live = state
+        if live is not None:
+            values = torch.where(live[:, None], values, 0)
+        output[:, column:column + values.shape[-1]].copy_(values)
+        return state
+
 
 
 

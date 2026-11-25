@@ -422,12 +422,40 @@ class PreparedDecoder:
         source = layer_scratch.hyperconnection.block_input
         self.embedding = PreparedEmbedding(language.embed_tokens.weight, state.ple.token_ids,
             scratch.embedding, num_rows=state.gdn.num_tokens, session=session, name=f"{name}.embedding")
+        last_index = len(language.layers) - 1
+        # A non-terminal chunk without classic MTP draft-residual retention never consumes the final
+        # layer's residual stream. When the final layer is QSA and not a DFlash2 feature tap, only
+        # its KV and selector-cache writes persist; sparse attention, o_proj, MLP, and final-layer
+        # collectives are skipped.
+        self.last_layer_cache_only = (
+            not self.sample
+            and not getattr(state, "maintain_draft_state", False)
+            and residual_output is None
+            and layer_outputs is None
+            and last_index >= 0
+            and last_index % 4 == 3
+        )
         self.layers, self.reductions, self.pipelined_reductions = [], [], []
         for index, (module, layer_weights) in enumerate(zip(language.layers, weights.layers, strict=True)):
             prefix = f"{name}.layer{index}"
+            is_cache_only = self.last_layer_cache_only and index == last_index
             attn_hc = PreparedHyperconnection(module.attn_hyper_connection, layer_scratch.hyperconnection,
                 priming_state=layer_scratch.residual, session=session, name=f"{prefix}.attn_hc",
                 runtime=runtime, coordinator=coordinator)
+            if is_cache_only:
+                attention = PreparedAttention(module.self_attn, layer_weights.attention, source,
+                    layer_scratch.qsa, qsa_states[index], layer_qsa_meta, rotary, session=session, name=f"{prefix}.qsa",
+                    workspace=workspaces, projection_workspace=workspaces,
+                    max_cache_pages=max_cache_pages, draft_tokens=state.pool.layout.speculative_tokens,
+                    cache_only=True, shard=shard, coordinator=coordinator)
+                self.layers.append((attn_hc, attention, None, None))
+                if self.pipelined_prefill:
+                    self.pipelined_reductions.append((None, None, None, None))
+                elif runtime is not None:
+                    self.reductions.append((None, None))
+                if progress is not None:
+                    progress(f"prepared {name} layer {index + 1}/48")
+                continue
             mlp_hc = PreparedHyperconnection(module.mlp_hyper_connection, layer_scratch.hyperconnection,
                 priming_state=layer_scratch.residual, session=session, name=f"{prefix}.mlp_hc",
                 runtime=runtime, coordinator=coordinator)
@@ -494,6 +522,8 @@ class PreparedDecoder:
             if self.sample else None
         )
         for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
+            if mlp_hc is None:
+                continue
             attn_hc.prepare_combine_norm(mlp_hc, priming_state=layer_scratch.residual,
                 session=session, name=f"{name}.layer{index}.attn_combine_norm")
             if index != 0 and (self.sample or index + 1 < len(self.layers)):
@@ -503,15 +533,17 @@ class PreparedDecoder:
         if self.pipelined_prefill:
             for index, (attn_hc, attention, mlp_hc, _) in enumerate(self.layers):
                 cr_att_0, cr_att_1, cr_mlp_0, cr_mlp_1 = self.pipelined_reductions[index]
-                attn_cn = attn_hc.plans["combine_norm"]
-                workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
-                workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
-                if index > 0 and "combine_norm" in mlp_hc.plans:
-                    workspaces.register_parallel(cr_mlp_1.reduce.plan, mlp_hc.plans["combine_norm"])
+                if mlp_hc is not None:
+                    attn_cn = attn_hc.plans["combine_norm"]
+                    workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
+                    workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
+                    if index > 0 and "combine_norm" in mlp_hc.plans:
+                        workspaces.register_parallel(cr_mlp_1.reduce.plan, mlp_hc.plans["combine_norm"])
                 if index >= 2:
                     prev_cr_mlp_1 = self.pipelined_reductions[index - 1][3]
                     prev_mlp_cn = self.layers[index - 1][2].plans["combine_norm"]
-                    workspaces.register_parallel(cr_att_0.reduce.plan, prev_mlp_cn)
+                    if cr_att_0 is not None:
+                        workspaces.register_parallel(cr_att_0.reduce.plan, prev_mlp_cn)
                     for plan in _hc_plans(attn_hc) + _attention_plans(attention, is_qsa=index % 4 == 3):
                         workspaces.register_parallel(prev_cr_mlp_1.reduce.plan, plan)
         if self.sample:
@@ -558,12 +590,38 @@ class PreparedDecoder:
     def capture_context(self, metadata, draft_config, *, compact_prefill=False):
         from hyperflare_recipes.components.dflash2 import PreparedContextCapture
 
+        if self.last_layer_cache_only and (len(self.layers) - 1) in draft_config.target_layers:
+            raise ValueError("cannot capture context from a cache-only final layer")
         self.context_layers = draft_config.target_layers
         self.context_capture = PreparedContextCapture(metadata,
             2560 * len(self.context_layers), draft_config.attention.window,
             compact_prefill=compact_prefill)
         self.auxiliary = torch.empty(self.context_capture.shape, dtype=torch.bfloat16,
                                      device=self.context_capture.device)
+
+    def _capture_context_layer(self, capture, layer_index: int, res_a: torch.Tensor, res_b: torch.Tensor | None = None):
+        column = self.context_layers.index(layer_index) * 2560
+        _, indices, _ = capture
+        if indices is None:
+            if res_b is None:
+                features = res_a.view(-1, 4, 2560).mean(dim=1)
+            else:
+                features = torch.cat(
+                    (res_a.view(-1, 4, 2560).mean(dim=1), res_b.view(-1, 4, 2560).mean(dim=1)),
+                    dim=0,
+                )
+            self.context_capture(capture, features, column)
+            return
+        if res_b is None:
+            selected = res_a[indices]
+        else:
+            half = res_a.shape[0]
+            selected = torch.where(
+                (indices < half)[:, None],
+                res_a[indices.clamp(max=half - 1)],
+                res_b[(indices - half).clamp(min=0)],
+            )
+        self.context_capture.write_selected(capture, selected.view(-1, 4, 2560).mean(dim=1), column)
 
     def functional(self, *, session):
         if getattr(self, "_functional_requested", False):
@@ -576,14 +634,18 @@ class PreparedDecoder:
                 attention.functional(session=session, dynamic_metadata=True)
             else:
                 attention.functional(session=session)
-            mlp_hc.functional(session=session)
-            moe.functional(session=session)
+            if mlp_hc is not None:
+                mlp_hc.functional(session=session)
+            if moe is not None:
+                moe.functional(session=session)
         for pair in self.reductions:
             for reduction in pair:
-                reduction.functional(session=session)
+                if reduction is not None:
+                    reduction.functional(session=session)
         for group in self.pipelined_reductions:
             for reduction in group:
-                reduction.functional(session=session)
+                if reduction is not None:
+                    reduction.functional(session=session)
         self.ple.functional(session=session)
         if self.final_mixer is not None:
             self.final_mixer.functional(session=session)
@@ -618,14 +680,26 @@ class PreparedDecoder:
                 residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
                 res_a, res_b = residual[:h], residual[h:]
                 norm_a = norm_b = None
-            prev_feat_a = None
+            if mlp_hc is None:
+                if pending_prev is not None:
+                    prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_a, prev_mlp_a, prev_inj_a, prev_res_b, prev_inj_b = pending_prev
+                    res_a, norm_a = prev_mlp_hc.combine_norm_runtime(prev_res_a, prev_mlp_a, prev_inj_a)
+                mixed_a, _ = attn_hc.mix_runtime(res_a, norm_a)
+                attention(mixed_a, qsa_a)
+                if pending_prev is not None:
+                    prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, attention.state.compressed_k_cache)
+                    res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
+                    if (index - 1) in self.context_layers:
+                        self._capture_context_layer(capture, index - 1, res_a, res_b)
+                    pending_prev = None
+                mixed_b, _ = attn_hc.mix_runtime(res_b, norm_b)
+                attention(mixed_b, qsa_b)
+                return residual, None
             if pending_prev is not None:
                 prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_a, prev_mlp_a, prev_inj_a, prev_res_b, prev_inj_b = pending_prev
                 res_a, norm_a = prev_mlp_hc.combine_norm_runtime(prev_res_a, prev_mlp_a, prev_inj_a)
                 if self.layer_outputs is not None:
                     self.layer_outputs[index - 1][:h].copy_(res_a)
-                if (index - 1) in self.context_layers:
-                    prev_feat_a = res_a.view(-1, 4, 2560).mean(dim=1)
             mixed_a, attn_inj_a = attn_hc.mix_runtime(res_a, norm_a)
             if not is_qsa:
                 out_a = attention(mixed_a, metadata=gdn_a)
@@ -657,12 +731,7 @@ class PreparedDecoder:
                 if self.layer_outputs is not None:
                     self.layer_outputs[index - 1][h:].copy_(res_b)
                 if (index - 1) in self.context_layers:
-                    prev_feat_b = res_b.view(-1, 4, 2560).mean(dim=1)
-                    self.context_capture(
-                        capture,
-                        torch.cat((prev_feat_a, prev_feat_b), dim=0),
-                        self.context_layers.index(index - 1) * 2560,
-                    )
+                    self._capture_context_layer(capture, index - 1, res_a, res_b)
                 pending_prev = None
             mixed_b, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
             if not is_qsa:
@@ -697,8 +766,7 @@ class PreparedDecoder:
                 if self.layer_outputs is not None:
                     self.layer_outputs[0].copy_(residual)
                 if 0 in self.context_layers:
-                    features = residual.view(-1, 4, 2560).mean(dim=1)
-                    self.context_capture(capture, features, self.context_layers.index(0) * 2560)
+                    self._capture_context_layer(capture, 0, residual)
             elif index < last_layer:
                 pending_prev = (cr_mlp_1, mlp_hc, p_mlp_b, res_a, mlp_a, mlp_inj_a, res_b, mlp_inj_b)
             else:
@@ -717,8 +785,7 @@ class PreparedDecoder:
                 if self.layer_outputs is not None:
                     self.layer_outputs[index].copy_(residual)
                 if index in self.context_layers:
-                    features = residual.view(-1, 4, 2560).mean(dim=1)
-                    self.context_capture(capture, features, self.context_layers.index(index) * 2560)
+                    self._capture_context_layer(capture, index, residual)
         return residual, normalized
 
     def __call__(self, runtime):
@@ -744,6 +811,10 @@ class PreparedDecoder:
                     residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
                     normalized = None
                 mixed, injection = attn_hc.mix_runtime(residual, normalized)
+                if mlp_hc is None:
+                    attention(mixed, runtime.qsa)
+                    normalized = None
+                    break
                 if index % 4 != 3:
                     layer_records = None if records is None or index not in records.layers else records[index]
                     block = attention(mixed, records=layer_records, metadata=runtime.gdn,
@@ -765,8 +836,7 @@ class PreparedDecoder:
                 if self.layer_outputs is not None:
                     self.layer_outputs[index].copy_(residual)
                 if index in self.context_layers:
-                    features = residual.view(-1, 4, 2560).mean(dim=1)
-                    self.context_capture(capture, features, self.context_layers.index(index) * 2560)
+                    self._capture_context_layer(capture, index, residual)
         if not self.sample:
             self.state.finish_runtime(runtime, None, residual)
             if self.completion_recorder is not None:

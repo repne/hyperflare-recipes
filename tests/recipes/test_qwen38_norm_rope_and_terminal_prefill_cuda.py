@@ -206,7 +206,16 @@ def _run_decoder_forward_with_capture(decoder, out_draft):
     out_draft.copy_(aux.draft_features)
 
 
-def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, cache_dir: str, error_queue):
+def _tp2_terminal_prefill_worker(
+    rank: int,
+    world: int,
+    port: int,
+    tokens: int,
+    cache_dir: str,
+    error_queue,
+    num_layers: int = 5,
+    maintain_draft_state: bool = True,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/.triton/cache"))
@@ -244,7 +253,7 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
     try:
         coordinator = CollectivePreparation(group)
         shard = TensorParallelShard(rank, world)
-        weights = _make_mini_model_weights(device, shard, num_layers=5)
+        weights = _make_mini_model_weights(device, shard, num_layers=num_layers)
         context = 16384
         num_pages = 256
         slots = 4
@@ -288,14 +297,16 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
 
         ref_pool, ref_req, ref_in, ref_cache, ref_comp = build_env()
         split_pool, split_req, split_in, split_cache, split_comp = build_env()
-        draft_cfg = SimpleNamespace(target_layers=(0, 1, 2, 3, 4), attention=SimpleNamespace(window=256))
-        ref_draft_out = torch.empty((256, 5 * 2560), dtype=torch.bfloat16, device=device)
-        split_draft_out = torch.empty((256, 5 * 2560), dtype=torch.bfloat16, device=device)
+        expect_cache_only = (not maintain_draft_state) and ((num_layers - 1) % 4 == 3)
+        tap_layers = tuple(range(num_layers - 1)) if expect_cache_only else tuple(range(num_layers))
+        draft_cfg = SimpleNamespace(target_layers=tap_layers, attention=SimpleNamespace(window=256))
+        ref_draft_out = torch.empty((256, len(tap_layers) * 2560), dtype=torch.bfloat16, device=device)
+        split_draft_out = torch.empty((256, len(tap_layers) * 2560), dtype=torch.bfloat16, device=device)
 
         session = RecordedPreparationSession(
             device=device,
-            checkpoint=f"test_qwen38_terminal_{tokens}",
-            workload_schema=f"test_qwen38_terminal_{tokens}",
+            checkpoint=f"test_qwen38_terminal_{tokens}_{num_layers}_{int(maintain_draft_state)}",
+            workload_schema=f"test_qwen38_terminal_{tokens}_{num_layers}_{int(maintain_draft_state)}",
             numerical_policy="default",
             coordinator=coordinator,
             autotune_effort="off",
@@ -326,7 +337,7 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             )
 
         ref_scratch = DecoderScratch.allocate(tokens, device, sample_rows=1, world_size=world)
-        ref_state = PreparedDecoderState(ref_in, ref_req, ref_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True)
+        ref_state = PreparedDecoderState(ref_in, ref_req, ref_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=maintain_draft_state)
         ref_dec = PreparedDecoder(
             weights, ref_scratch, ref_state, ref_cache, rotary, table, arena,
             ref_comp, frame, sequence, session=session, name=f"ref_term_{tokens}",
@@ -345,7 +356,7 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
         ref_dec.release_outputs()
 
         split_scratch = DecoderScratch.allocate(tokens, device, sample_rows=1, world_size=world)
-        nonterm_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True)
+        nonterm_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=maintain_draft_state)
         nonterm_dec = PreparedDecoder(
             weights, split_scratch, nonterm_state, split_cache, rotary, table, arena,
             split_comp, frame, sequence, session=session, name=f"nonterm_{tokens}",
@@ -356,19 +367,24 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
         assert nonterm_dec.sampler is None
         assert nonterm_dec.completion_recorder is not None
         assert nonterm_dec.pipelined_prefill is (tokens >= 4096)
-        nonterm_dec.capture_context(
-            SimpleNamespace(
-                positions=nonterm_state.qsa.query_positions, starts=nonterm_state.token_state.positions,
-                lengths=nonterm_state.inputs.query_lengths[:1], requests=nonterm_state.qsa.request_ids,
-                state_rows=nonterm_state.gdn.convolution_slots, query_start_loc=nonterm_state.gdn.query_start_loc,
-            ),
-            draft_cfg,
-            compact_prefill=True,
+        assert nonterm_dec.last_layer_cache_only is expect_cache_only
+        assert getattr(nonterm_dec.layers[-1][1], "cache_only", False) is expect_cache_only
+        assert (nonterm_dec.layers[-1][2] is None) is expect_cache_only
+        assert (nonterm_dec.layers[-1][3] is None) is expect_cache_only
+        capture_meta = SimpleNamespace(
+            positions=nonterm_state.qsa.query_positions, starts=nonterm_state.token_state.positions,
+            lengths=nonterm_state.inputs.query_lengths[:1], requests=nonterm_state.qsa.request_ids,
+            state_rows=nonterm_state.gdn.convolution_slots, query_start_loc=nonterm_state.gdn.query_start_loc,
         )
+        if expect_cache_only:
+            bad_cfg = SimpleNamespace(target_layers=(0, num_layers - 1), attention=SimpleNamespace(window=256))
+            with pytest.raises(ValueError, match="cache-only final layer"):
+                nonterm_dec.capture_context(capture_meta, bad_cfg, compact_prefill=True)
+        nonterm_dec.capture_context(capture_meta, draft_cfg, compact_prefill=True)
         nonterm_dec.functional(session=session)
         nonterm_dec.release_outputs()
 
-        term_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True)
+        term_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=maintain_draft_state)
         term_dec = PreparedDecoder(
             weights, split_scratch, term_state, split_cache, rotary, table, arena,
             split_comp, frame, sequence, session=session, name=f"term_{tokens}",
@@ -379,6 +395,8 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
         assert term_dec.sampler is not None
         assert term_dec.completion_recorder is None
         assert term_dec.pipelined_prefill is (tokens >= 4096)
+        assert term_dec.last_layer_cache_only is False
+        assert getattr(term_dec.layers[-1][1], "cache_only", False) is False
         term_dec.functional(session=session)
         term_dec.release_outputs()
         term_fwd = PreparedDecoderForward(term_dec)
@@ -488,6 +506,9 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             stream.synchronize()
             ref_chunk0_residual_repeat = ref_pool.region("target_residual")[1].clone()
             ref_chunk0_draft_repeat = ref_draft_out.clone()
+            ref_chunk0_mk_repeat = final_ref_cache[3].main_k_cache.clone()
+            ref_chunk0_mv_repeat = final_ref_cache[3].main_v_cache.clone()
+            ref_chunk0_ck_repeat = final_ref_cache[3].compressed_k_cache.clone()
             chunk1_len = tokens // 2 + 17
             sequence.fill_(12)
             stage_chunk(ref_in, consumed=tokens, live_len=chunk1_len, sample_enabled=True, token_values=tok1, rope_offset=20)
@@ -525,22 +546,23 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             assert int(split_req.pending_token[0].item()) == -1
             assert torch.equal(split_req.rng_counter, ref_req.rng_counter)
             assert torch.equal(split_pool.last_hidden[1], poisoned_hidden), "non-terminal prefill mutated last_hidden"
-            # Verify MTP target_residual/target_residual_position and DFlash2 context capture on sample=False.
-            assert torch.equal(
-                split_pool.region("target_residual_position")[1],
-                ref_pool.region("target_residual_position")[1],
-            ), "chunk 0 target_residual_position diverged"
-            res0_repeat = (
-                (ref_chunk0_residual_repeat.float() - ref_pool.region("target_residual")[1].float()).norm()
-                / ref_pool.region("target_residual")[1].float().norm().clamp_min(1e-6)
-            ).item()
-            res0_rel = (
-                (split_pool.region("target_residual")[1].float() - ref_pool.region("target_residual")[1].float()).norm()
-                / ref_pool.region("target_residual")[1].float().norm().clamp_min(1e-6)
-            ).item()
-            assert res0_rel <= max(2e-3, 2.5 * res0_repeat) and res0_rel < 0.15, (
-                f"chunk 0 target_residual diverged: rel_l2={res0_rel:.6f} (repeat={res0_repeat:.6f})"
-            )
+            # Verify MTP target_residual/target_residual_position (when maintained) and DFlash2 context capture on sample=False.
+            if maintain_draft_state:
+                assert torch.equal(
+                    split_pool.region("target_residual_position")[1],
+                    ref_pool.region("target_residual_position")[1],
+                ), "chunk 0 target_residual_position diverged"
+                res0_repeat = (
+                    (ref_chunk0_residual_repeat.float() - ref_pool.region("target_residual")[1].float()).norm()
+                    / ref_pool.region("target_residual")[1].float().norm().clamp_min(1e-6)
+                ).item()
+                res0_rel = (
+                    (split_pool.region("target_residual")[1].float() - ref_pool.region("target_residual")[1].float()).norm()
+                    / ref_pool.region("target_residual")[1].float().norm().clamp_min(1e-6)
+                ).item()
+                assert res0_rel <= max(2e-3, 2.5 * res0_repeat) and res0_rel < 0.15, (
+                    f"chunk 0 target_residual diverged: rel_l2={res0_rel:.6f} (repeat={res0_repeat:.6f})"
+                )
             draft0_repeat = (
                 (ref_chunk0_draft_repeat.float() - ref_draft_out.float()).norm()
                 / ref_draft_out.float().norm().clamp_min(1e-6)
@@ -558,6 +580,23 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
                 final_split_cache[3].raw_interval_start_positions,
                 final_ref_cache[3].raw_interval_start_positions,
             )
+            if expect_cache_only:
+                for label, actual, ref, repeat_ref in (
+                    ("main_k_cache", final_split_cache[3].main_k_cache, final_ref_cache[3].main_k_cache, ref_chunk0_mk_repeat),
+                    ("main_v_cache", final_split_cache[3].main_v_cache, final_ref_cache[3].main_v_cache, ref_chunk0_mv_repeat),
+                    ("compressed_k_cache", final_split_cache[3].compressed_k_cache, final_ref_cache[3].compressed_k_cache, ref_chunk0_ck_repeat),
+                ):
+                    rep = (
+                        (repeat_ref.float() - ref.float()).norm()
+                        / ref.float().norm().clamp_min(1e-6)
+                    ).item()
+                    rel = (
+                        (actual.float() - ref.float()).norm()
+                        / ref.float().norm().clamp_min(1e-6)
+                    ).item()
+                    assert rel <= max(2e-3, 2.5 * rep) and rel < 0.15, (
+                        f"cache-only final layer {label} diverged: rel_l2={rel:.6f} (repeat={rep:.6f})"
+                    )
 
             # Inactive replay on non-terminal graph must preserve all persistent state bit-for-bit.
             snap_backing = split_pool.backing.clone()
@@ -639,7 +678,26 @@ def test_qwen38_nonterminal_and_terminal_prefill_tp2(tokens):
         errors = ctx.Queue()
         mp.spawn(
             _tp2_terminal_prefill_worker,
-            args=(2, port, tokens, tmpdir, errors),
+            args=(2, port, tokens, tmpdir, errors, 5, True),
+            nprocs=2,
+            join=True,
+        )
+        assert errors.empty(), errors.get()
+
+
+@pytest.mark.parametrize("tokens", [512, 4096])
+def test_qwen38_nonterminal_cache_only_last_layer_tp2(tokens):
+    """Non-terminal prefill without MTP residual retention uses cache-only QSA on the final layer on TP2."""
+    _requires_tp2()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ctx = mp.get_context("spawn")
+        errors = ctx.Queue()
+        mp.spawn(
+            _tp2_terminal_prefill_worker,
+            args=(2, port, tokens, tmpdir, errors, 4, False),
             nprocs=2,
             join=True,
         )

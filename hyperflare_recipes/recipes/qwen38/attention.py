@@ -261,7 +261,7 @@ class PreparedAttention:
         # SM103 sizes score_workspace_bytes to cover the full context; unsharded SM120 keeps
         # b12x's default 128 MiB score workspace.
         score_workspace = (
-            None if use_sharded
+            None if use_sharded or cache_only
             else max(self.tokens * (context // 4) * 4, 128 << 20) if sm103.is_sm103(source.device)
             else None
         )
