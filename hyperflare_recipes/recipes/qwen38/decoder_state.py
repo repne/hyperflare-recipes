@@ -162,14 +162,16 @@ def _metadata(Slots, Live, Lengths, Pending, Positions, Active, Delta, Tokens, I
 
 @triton.jit
 def _residual_checkpoint(Source, Saved, Rope, SavedRope, Slots, Active, Cu,
-                         StateRows, SAVED_STRIDE: tl.constexpr, ROPE_STRIDE: tl.constexpr, BLOCK: tl.constexpr, SLOTS: tl.constexpr = 4):
+                         StateRows, SAVED_STRIDE: tl.constexpr, ROPE_STRIDE: tl.constexpr, BLOCK: tl.constexpr,
+                         SLOTS: tl.constexpr = 4, SINGLE_ROW: tl.constexpr = False):
     row, tile = tl.program_id(0), tl.program_id(1)
     channel = tile * BLOCK + tl.arange(0, BLOCK)
     slot = tl.load(Slots + row)
     state_row = tl.load(StateRows + slot * 8, (slot >= 0) & (slot < SLOTS), other=0)
     begin, end = tl.load(Cu + row), tl.load(Cu + row + 1)
     active = (tl.load(Active + row) != 0) & (slot >= 0) & (slot < SLOTS) & (end > begin)
-    value = tl.load(Source + (end - 1) * 10240 + channel, active & (channel < 10240), other=0)
+    src_row = 0 if SINGLE_ROW else (end - 1)
+    value = tl.load(Source + src_row * 10240 + channel, active & (channel < 10240), other=0)
     tl.store(Saved + state_row * SAVED_STRIDE + channel, value, active & (channel < 10240))
     if tile == 0:
         axes = tl.arange(0, 4)
@@ -199,7 +201,8 @@ def _rope_delta_checkpoint(Delta, Slots, Active, Cu, Positions, Rope, StateRows,
 @triton.jit
 def _hidden_checkpoint(Hidden, Saved, Delta, Sample, Slots, Active, Cu, Positions, Rope,
                        StateRows, SAVED_STRIDE: tl.constexpr, DELTA_STRIDE: tl.constexpr,
-                       PREFILL: tl.constexpr, POSITION_BLOCK: tl.constexpr, BLOCK: tl.constexpr, SLOTS: tl.constexpr = 4):
+                       PREFILL: tl.constexpr, POSITION_BLOCK: tl.constexpr, BLOCK: tl.constexpr,
+                       SLOTS: tl.constexpr = 4, SINGLE_ROW: tl.constexpr = False):
     row = tl.program_id(0)
     channel = tl.arange(0, BLOCK)
     slot = tl.load(Slots + row)
@@ -207,7 +210,8 @@ def _hidden_checkpoint(Hidden, Saved, Delta, Sample, Slots, Active, Cu, Position
     valid = (tl.load(Active + row) != 0) & (slot >= 0) & (slot < SLOTS)
     begin, end = tl.load(Cu + row), tl.load(Cu + row + 1)
     valid &= end > begin
-    value = tl.load(Hidden + (end - 1) * 2560 + channel, valid & (channel < 2560), other=0)
+    hidden_row = 0 if SINGLE_ROW else (end - 1)
+    value = tl.load(Hidden + hidden_row * 2560 + channel, valid & (channel < 2560), other=0)
     tl.store(Sample + row * 2560 + channel, value, channel < 2560)
     tl.store(Saved + state_row * SAVED_STRIDE + channel, value, valid & (channel < 2560))
     if PREFILL:
@@ -293,12 +297,15 @@ class PreparedDecoderState:
         self._metadata = compile_kernel(_metadata, args, (rows, 1, 1))
         self._hidden = self._rope_delta = self._residual = None
 
-    def prepare_hidden(self, hidden, sample):
+    def prepare_hidden(self, hidden, sample, *, single_row: bool = False):
+        if single_row and self.rows != 1:
+            raise ValueError("single-row hidden checkpoint requires a single-row prefill state")
         self._hidden = compile_kernel(_hidden_checkpoint,
             (hidden, self.pool.last_hidden, self.pool.rope_delta, sample, self.inputs.row_slot_ids,
              self.token_state.active, self.gdn.query_start_loc, self.token_state.positions, self.qsa.rope_positions,
              self.inputs.request_state_rows, self.pool.last_hidden.stride(0), self.pool.rope_delta.stride(0),
-             self.mode == "prefill", triton.next_power_of_2(self.tokens * 3), 4096, self.requests.capacity), (self.rows, 1, 1))
+             self.mode == "prefill", triton.next_power_of_2(self.tokens * 3), 4096, self.requests.capacity,
+             single_row), (self.rows, 1, 1))
 
     def prepare_rope_delta(self):
         if self.mode != "prefill":
@@ -309,13 +316,16 @@ class PreparedDecoderState:
              self.pool.rope_delta.stride(0), triton.next_power_of_2(self.tokens * 3), self.requests.capacity),
             (self.rows, 1, 1))
 
-    def prepare_residual(self, residual):
+    def prepare_residual(self, residual, *, single_row: bool = False):
+        if single_row and self.rows != 1:
+            raise ValueError("single-row residual checkpoint requires a single-row prefill state")
         if self.pool.layout.speculative_tokens and self.maintain_draft_state:
             saved = self.pool.region("target_residual")
             rope = self.pool.region("target_residual_position")
             self._residual = compile_kernel(_residual_checkpoint,
                 (residual, saved, self.qsa.rope_positions, rope, self.inputs.row_slot_ids, self.token_state.active,
-                 self.gdn.query_start_loc, self.inputs.request_state_rows, saved.stride(0), rope.stride(0), 1024, self.requests.capacity), (self.rows, 10, 1))
+                 self.gdn.query_start_loc, self.inputs.request_state_rows, saved.stride(0), rope.stride(0),
+                 1024, self.requests.capacity, single_row), (self.rows, 10, 1))
 
     def functional(self, *, dynamic_inputs=False):
         if self.gdn is None:

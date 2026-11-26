@@ -426,16 +426,27 @@ class PreparedDecoder:
             and row_sharded_qsa_fits
             and runtime.should_allreduce(scratch.hidden[:half])
         )
+        self.tokens = scratch.residual.shape[0]
         self.half_tokens = half if self.pipelined_prefill else 0
         self._name = name
         self._runtime = runtime
         self._barrier_runtime = barrier_runtime
         self._coordinator = coordinator
-        self._needs_full_residual = bool(
+        from .decoder_state import PreparedDecoderState
+
+        is_single_prefill_state = (
+            isinstance(state, PreparedDecoderState) and state.mode == "prefill" and state.rows == 1
+        )
+        self._single_row_final_mixer = bool(
+            self.sample and scoring is None and is_single_prefill_state and self.tokens > 1
+        )
+        needs_any_residual = bool(
             getattr(state, "maintain_draft_state", False)
             or residual_output is not None
             or verification
         )
+        self._single_row_residual = False
+        self._needs_full_residual = needs_any_residual
         self.row_shard_dma = False
         self.shard_tokens = 0
         self.shard_rows_a = self.shard_rows_b = None
@@ -448,6 +459,7 @@ class PreparedDecoder:
         self.layer_attn_mxfp8 = ()
         self.final_res_gather_a = self.final_res_gather_b = None
         self.final_hidden_gather_a = self.final_hidden_gather_b = None
+        self.final_row_reduce = None
         self.context_capture_reduce = None
         self.sharded_context_layers = ()
         ffn_local_packed = ffn_full_packed = None
@@ -484,6 +496,14 @@ class PreparedDecoder:
                     self.shard_rows_b = persistent_copy(torch.arange(half + s0, half + s0 + st, dtype=torch.int64, device=dev))
                     self.shard_offset_a = persistent_copy(torch.tensor([s0], dtype=torch.int64, device=dev))
                     self.shard_offset_b = persistent_copy(torch.tensor([half + s0], dtype=torch.int64, device=dev))
+                    if (
+                        is_single_prefill_state
+                        and residual_output is None
+                        and not verification
+                        and getattr(state, "maintain_draft_state", False)
+                    ):
+                        self._single_row_residual = True
+                        self._needs_full_residual = False
         if self.pipelined_prefill:
             layer_scratch = scratch.rows(half, state.rows)
             shard_scratch = scratch.rows(self.shard_tokens, state.rows) if self.row_shard_dma else None
@@ -725,18 +745,23 @@ class PreparedDecoder:
             mode=state.mode, session=session, name=f"{name}.ple", workspace=workspaces,
             partitions=getattr(state, "ple_partitions", None),
             runtime=runtime if barrier_runtime is None else barrier_runtime, coordinator=coordinator)
-        final_hc_scratch = shard_scratch if self.row_shard_dma else scratch
+        if self._single_row_final_mixer:
+            final_hc_scratch = scratch.rows(1, 1)
+            final_mixer_runtime = barrier_runtime if barrier_runtime is not None else runtime
+        else:
+            final_hc_scratch = shard_scratch if self.row_shard_dma else scratch
+            final_mixer_runtime = runtime
         self.final_mixer = (
             PreparedHyperconnection(language.hyper_connection_mixer,
                 replace(final_hc_scratch.hyperconnection, block_input=final_hc_scratch.hidden),
                 priming_state=final_hc_scratch.residual,
-                session=session, name=f"{name}.final_mixer", runtime=runtime, coordinator=coordinator)
+                session=session, name=f"{name}.final_mixer", runtime=final_mixer_runtime, coordinator=coordinator)
             if self.sample else None
         )
         if self.row_shard_dma:
-            from ignition.components.collectives import PreparedChunkedGatherShards, PreparedGatherShards
+            from ignition.components.collectives import PreparedAllReduce, PreparedChunkedGatherShards, PreparedGatherShards
 
-            if self.sample:
+            if self.sample and not self._single_row_final_mixer:
                 self.final_hidden_gather_a = PreparedGatherShards(
                     shard_scratch.hidden, layer_scratch.hidden, runtime=runtime, session=session,
                     coordinator=coordinator, name=f"{name}.final_hidden_gather.a")
@@ -750,13 +775,22 @@ class PreparedDecoder:
                 self.final_res_gather_b = PreparedChunkedGatherShards(
                     shard_scratch.residual, layer_scratch.residual, runtime=runtime, session=session,
                     coordinator=coordinator, name=f"{name}.final_res_gather.b")
+            elif self._single_row_final_mixer or self._single_row_residual:
+                dev = scratch.residual.device
+                row_in = torch.zeros((1, 10240), dtype=torch.bfloat16, device=dev)
+                row_out = torch.empty_like(row_in)
+                row_rt = barrier_runtime if barrier_runtime is not None else runtime
+                self.final_row_reduce = PreparedAllReduce(
+                    row_in, row_out, runtime=row_rt, session=session,
+                    coordinator=coordinator, name=f"{name}.final_row_reduce",
+                )
         for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
             if mlp_hc is None:
                 continue
             hc_scratch = shard_scratch if (self.row_shard_dma and index >= 1) else layer_scratch
             attn_hc.prepare_combine_norm(mlp_hc, priming_state=hc_scratch.residual,
                 session=session, name=f"{name}.layer{index}.attn_combine_norm")
-            if index != 0 and (self.sample or index + 1 < len(self.layers)):
+            if index != 0 and ((self.sample and not self._single_row_final_mixer) or index + 1 < len(self.layers)):
                 following = self.layers[index + 1][0] if index + 1 < len(self.layers) else self.final_mixer
                 mlp_hc.prepare_combine_norm(following, priming_state=hc_scratch.residual,
                     session=session, name=f"{name}.layer{index}.mlp_combine_norm")
@@ -807,10 +841,16 @@ class PreparedDecoder:
                     for plan in _hc_plans(attn_hc) + _attention_plans(attention, is_qsa=index % 4 == 3):
                         workspaces.register_parallel(prev_cr_mlp_1.reduce.plan, plan)
         if self.sample:
-            state.prepare_hidden(scratch.hidden, scratch.sample_hidden)
+            if self._single_row_final_mixer:
+                state.prepare_hidden(scratch.hidden[:1], scratch.sample_hidden, single_row=True)
+            else:
+                state.prepare_hidden(scratch.hidden, scratch.sample_hidden)
         else:
             state.prepare_rope_delta()
-        state.prepare_residual(scratch.residual)
+        if self._single_row_residual:
+            state.prepare_residual(scratch.residual[:1], single_row=True)
+        else:
+            state.prepare_residual(scratch.residual)
         if not self.sample:
             self.lm_head = None
         elif vocabulary_runtime is None:
@@ -948,6 +988,9 @@ class PreparedDecoder:
             if self.residual_output is not None and self.final_res_gather_a is None:
                 from ignition.components.collectives import PreparedChunkedGatherShards
 
+                if self._single_row_residual:
+                    self._single_row_residual = False
+                    self.state.prepare_residual(self.scratch.residual, single_row=False)
                 self.final_res_gather_a = PreparedChunkedGatherShards(
                     self.scratch.residual[:self.shard_tokens], self.scratch.residual[:self.half_tokens],
                     runtime=self._runtime, session=session, coordinator=self._coordinator,
@@ -956,8 +999,9 @@ class PreparedDecoder:
                     self.scratch.residual[:self.shard_tokens], self.scratch.residual[:self.half_tokens],
                     runtime=self._runtime, session=session, coordinator=self._coordinator,
                     name=f"{self._name}.final_res_gather.b")
+                self.final_row_reduce = None
             for gather in (self.final_hidden_gather_a, self.final_hidden_gather_b,
-                           self.final_res_gather_a, self.final_res_gather_b):
+                           self.final_res_gather_a, self.final_res_gather_b, self.final_row_reduce):
                 if gather is not None:
                     gather.functional(session=session)
             if self.context_capture is not None:
@@ -1252,7 +1296,7 @@ class PreparedDecoder:
                 pending_prev_b = (cr_mlp_1, mlp_hc, p_mlp_b, res_b, mlp_inj_b)
             else:
                 p_ffn_b = cr_ffn_1.start(ffn_b_send, dependencies=(mlp_a,))
-                if self.sample:
+                if self.sample and not self._single_row_final_mixer:
                     res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
                 else:
                     res_a = mlp_hc.combine_runtime(res_a, mlp_a, mlp_inj_a)
@@ -1260,7 +1304,7 @@ class PreparedDecoder:
                 moe_b = self._run_ffn_gathered(moe, ffn_b_full)
                 p_mlp_b = cr_mlp_1.start(moe_b, dependencies=(ffn_b_full, moe_b))
                 mlp_b = cr_mlp_1.finish(p_mlp_b, moe_b)
-                if self.sample:
+                if self.sample and not self._single_row_final_mixer:
                     res_b, norm_b = mlp_hc.combine_norm_runtime(res_b, mlp_b, mlp_inj_b)
                 else:
                     res_b = mlp_hc.combine_runtime(res_b, mlp_b, mlp_inj_b)
@@ -1269,13 +1313,33 @@ class PreparedDecoder:
 
         ctx_reduced = self._finish_sharded_context_capture(capture, sharded_ctx_slots)
         last_dep = () if ctx_reduced is None else (ctx_reduced,)
+        last_res = None
         if self.final_res_gather_a is not None:
             full_res_a = self.final_res_gather_a(res_a, dependencies=last_dep)
             full_res_b = self.final_res_gather_b(res_b, dependencies=(full_res_a,))
             residual = torch.cat((full_res_a, full_res_b), dim=0)
             last_dep = (full_res_b,)
+            if self._single_row_final_mixer:
+                last_idx = (runtime.gdn.query_start_loc[1:2] - 1).clamp(0, self.tokens - 1).to(torch.int64)
+                last_res = torch.index_select(residual, 0, last_idx)
+        elif self.final_row_reduce is not None:
+            last_idx = (runtime.gdn.query_start_loc[1:2] - 1).clamp(0, self.tokens - 1).to(torch.int64)
+            s0, s1, st = self.shard_offset_a, self.shard_offset_b, self.shard_tokens
+            in_a = (last_idx >= s0) & (last_idx < s0 + st)
+            in_b = (last_idx >= s1) & (last_idx < s1 + st)
+            row_a = torch.index_select(res_a, 0, (last_idx - s0).clamp(0, st - 1))
+            row_b = torch.index_select(res_b, 0, (last_idx - s1).clamp(0, st - 1))
+            local_row = torch.where(
+                in_a[:, None], row_a, torch.where(in_b[:, None], row_b, torch.zeros_like(row_a)),
+            )
+            last_res = self.final_row_reduce(local_row, dependencies=last_dep)
+            if self._single_row_residual:
+                residual = last_res
         if not self.sample:
             return residual, None
+        if self._single_row_final_mixer:
+            hidden, _ = self.final_mixer.mix_runtime(last_res, None)
+            return residual, hidden
         hid_a_sh, _ = self.final_mixer.mix_runtime(res_a, norm_a)
         hid_b_sh, _ = self.final_mixer.mix_runtime(res_b, norm_b)
         hid_a = self.final_hidden_gather_a(hid_a_sh, dependencies=last_dep)
@@ -1388,7 +1452,7 @@ class PreparedDecoder:
             elif index < last_layer:
                 pending_prev = (cr_mlp_1, mlp_hc, p_mlp_b, res_a, mlp_a, mlp_inj_a, res_b, mlp_inj_b)
             else:
-                if self.sample:
+                if self.sample and not self._single_row_final_mixer:
                     res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
                     mlp_b = cr_mlp_1.finish(p_mlp_b, res_a)
                     res_b, norm_b = mlp_hc.combine_norm_runtime(res_b, mlp_b, mlp_inj_b)
@@ -1450,7 +1514,7 @@ class PreparedDecoder:
                 block = moe(mixed)
                 if self.reductions:
                     block = self.reductions[index][1](block)
-                if index == 0 or (not self.sample and index + 1 == len(self.layers)):
+                if index == 0 or ((not self.sample or self._single_row_final_mixer) and index + 1 == len(self.layers)):
                     residual = mlp_hc.combine_runtime(residual, block, injection)
                     normalized = None
                 else:
@@ -1465,7 +1529,12 @@ class PreparedDecoder:
                 self.completion_recorder()
             return None, None, DecoderAuxiliary(residual, None if capture is None else capture[0]), records
         if hidden is None:
-            hidden, _ = self.final_mixer.mix_runtime(residual, normalized)
+            if self._single_row_final_mixer:
+                last_idx = (runtime.gdn.query_start_loc[1:2] - 1).clamp(0, self.tokens - 1).to(torch.int64)
+                last_res = torch.index_select(residual, 0, last_idx)
+                hidden, _ = self.final_mixer.mix_runtime(last_res, None)
+            else:
+                hidden, _ = self.final_mixer.mix_runtime(residual, normalized)
         if self.scoring is not None:
             self.scoring(hidden)
         sample = self.state.finish_runtime(runtime, hidden, residual)

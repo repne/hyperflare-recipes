@@ -524,6 +524,7 @@ def _tp2_terminal_prefill_worker(
         assert getattr(nonterm_dec.layers[-1][1], "cache_only", False) is expect_cache_only
         assert (nonterm_dec.layers[-1][2] is None) is expect_cache_only
         assert (nonterm_dec.layers[-1][3] is None) is expect_cache_only
+        assert nonterm_dec._single_row_residual is (nonterm_dec.row_shard_dma and maintain_draft_state)
         capture_meta = SimpleNamespace(
             positions=nonterm_state.qsa.query_positions, starts=nonterm_state.token_state.positions,
             lengths=nonterm_state.inputs.query_lengths[:1], requests=nonterm_state.qsa.request_ids,
@@ -550,6 +551,9 @@ def _tp2_terminal_prefill_worker(
         assert term_dec.pipelined_prefill is (tokens >= 4096)
         assert term_dec.last_layer_cache_only is False
         assert getattr(term_dec.layers[-1][1], "cache_only", False) is False
+        assert term_dec._single_row_final_mixer is True
+        assert term_dec.final_mixer.tokens == 1
+        assert term_dec._single_row_residual is (term_dec.row_shard_dma and maintain_draft_state)
         term_dec.functional(session=session)
         term_dec.release_outputs()
         term_fwd = PreparedDecoderForward(term_dec)
