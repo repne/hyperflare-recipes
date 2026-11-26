@@ -631,7 +631,8 @@ class ParallelProjections:
         from b12x.gemm.blockscaled._a16 import _weight_parts
 
         for projection in projections:
-            if not isinstance(projection, QuantizedProjection) or projection.bias is not None:
+            if (not isinstance(projection, QuantizedProjection) or projection.bias is not None
+                    or projection.encoded is not None or projection.encoded_layout is not None):
                 return False
             values, _, gain, fp4 = _weight_parts(projection.weight)
             if values.dtype not in (torch.float8_e4m3fn, torch.uint8) or gain is not None or fp4:

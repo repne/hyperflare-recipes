@@ -524,8 +524,14 @@ class PreparedDecoder:
         attn_full_encoded = None
         attn_local_packed = attn_full_packed = None
         mxfp8_gather_eligible = False
+        from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+
+        sm12x_gate = (
+            source.device.type == "cuda"
+            and torch.cuda.get_device_capability(source.device) in ((12, 0), (12, 1))
+            and not sharded_hc
+        )
         if self.row_shard_dma:
-            from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
             from b12x.preparation import PreparedCall
             from b12x.quantization import mxfp8
             from hyperflare_recipes.components import sm103
@@ -603,25 +609,51 @@ class PreparedDecoder:
                 output=layer_scratch.gdn.output,
                 pack_ba=True,
             )
+        direct_attn_encoded = None
         for index, (module, layer_weights) in enumerate(zip(language.layers, weights.layers, strict=True)):
             prefix = f"{name}.layer{index}"
             is_cache_only = self.last_layer_cache_only and index == last_index
             layer_sharded = self.row_shard_dma and index >= 1
             hc_scratch = shard_scratch if layer_sharded else layer_scratch
-            use_attn_mxfp8 = (
-                layer_sharded
-                and mxfp8_gather_eligible
-                and all(
-                    isinstance(w, MXFP8LinearWeight) and w.padded_in_features == 2560
-                    for key, w in layer_weights.attention.items()
-                    if key not in ("out_proj", "o_proj")
+            attn_inputs_mxfp8 = all(
+                isinstance(w, MXFP8LinearWeight) and w.padded_in_features == 2560
+                for key, w in layer_weights.attention.items()
+                if key not in ("out_proj", "o_proj")
+            )
+            use_attn_mxfp8 = layer_sharded and mxfp8_gather_eligible and attn_inputs_mxfp8
+            use_direct_attn_mxfp8 = (
+                not layer_sharded
+                and sm12x_gate
+                and source.shape[0] >= 64
+                and attn_inputs_mxfp8
+                and not (
+                    index % 4 == 3
+                    and not is_cache_only
+                    and qsa_gather_runtime is not None
+                    and qsa_shard_mode == "group"
+                    and shard is not None
+                    and shard.world_size > 1
                 )
             )
+            if use_direct_attn_mxfp8 and direct_attn_encoded is None:
+                from b12x.quantization import mxfp8
+
+                direct_shapes = mxfp8.dense_rows_storage_shapes(source.shape[0], 2560)
+                direct_attn_encoded = mxfp8.dense_rows_from_bases(
+                    torch.zeros(direct_shapes[0], dtype=torch.float8_e4m3fn, device=source.device),
+                    torch.full(direct_shapes[1], 127, dtype=torch.uint8, device=source.device),
+                    torch.full(direct_shapes[2], 127, dtype=torch.uint8, device=source.device),
+                )
             layer_attn_mxfp8.append(use_attn_mxfp8)
-            layer_input_encoded = attn_full_encoded if use_attn_mxfp8 else None
+            layer_input_encoded = (
+                attn_full_encoded if use_attn_mxfp8
+                else direct_attn_encoded if use_direct_attn_mxfp8
+                else None
+            )
             attn_hc = PreparedHyperconnection(module.attn_hyper_connection, hc_scratch.hyperconnection,
                 priming_state=hc_scratch.residual, session=session, name=f"{prefix}.attn_hc",
-                runtime=runtime, coordinator=coordinator)
+                runtime=runtime, coordinator=coordinator,
+                encoded_output=direct_attn_encoded if use_direct_attn_mxfp8 else None)
             if is_cache_only:
                 attention = PreparedAttention(module.self_attn, layer_weights.attention, source,
                     layer_scratch.qsa, qsa_states[index], layer_qsa_meta, rotary, session=session, name=f"{prefix}.qsa",
@@ -1068,6 +1100,13 @@ class PreparedDecoder:
         self.auxiliary = None
         self._runtime = self._barrier_runtime = self._coordinator = None
 
+    @staticmethod
+    def _mix_attn_input(attn_hc, residual: torch.Tensor, normalized: torch.Tensor | None):
+        mixed, injection = attn_hc.mix_runtime(residual, normalized)
+        if attn_hc.emits_mxfp8:
+            return mixed[0], mixed, injection
+        return mixed, None, injection
+
     def _prepare_attn_shard(self, layer_index: int, mixed: torch.Tensor) -> torch.Tensor:
         if not self.layer_attn_mxfp8[layer_index]:
             return mixed
@@ -1127,11 +1166,11 @@ class PreparedDecoder:
         attn_hc0, attention0, mlp_hc0, moe0 = self.layers[0]
         cr_att_0, cr_att_1, cr_mlp_0, cr_mlp_1 = self.pipelined_reductions[0]
         res_a, res_b = residual[:h], residual[h:]
-        mixed_a, attn_inj_a = attn_hc0.mix_runtime(res_a, None)
-        out_a = attention0(mixed_a, metadata=gdn_a)
+        mixed_a, enc_a, attn_inj_a = self._mix_attn_input(attn_hc0, res_a, None)
+        out_a = attention0(mixed_a, metadata=gdn_a, input_encoded_bases=enc_a)
         p_att_a = cr_att_0.start(out_a)
-        mixed_b, attn_inj_b = attn_hc0.mix_runtime(res_b, None)
-        out_b = attention0(mixed_b, metadata=gdn_b)
+        mixed_b, enc_b, attn_inj_b = self._mix_attn_input(attn_hc0, res_b, None)
+        out_b = attention0(mixed_b, metadata=gdn_b, input_encoded_bases=enc_b)
         att_a = cr_att_0.finish(p_att_a, out_b)
         p_att_b = cr_att_1.start(out_b, dependencies=(att_a,))
         res_a, norm_a = attn_hc0.combine_norm_runtime(res_a, att_a, attn_inj_a)
@@ -1395,32 +1434,32 @@ class PreparedDecoder:
                 if pending_prev is not None:
                     prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_a, prev_mlp_a, prev_inj_a, prev_res_b, prev_inj_b = pending_prev
                     res_a, norm_a = prev_mlp_hc.combine_norm_runtime(prev_res_a, prev_mlp_a, prev_inj_a)
-                mixed_a, _ = attn_hc.mix_runtime(res_a, norm_a)
-                attention(mixed_a, qsa_a)
+                mixed_a, enc_a, _ = self._mix_attn_input(attn_hc, res_a, norm_a)
+                attention(mixed_a, qsa_a, input_encoded_bases=enc_a)
                 if pending_prev is not None:
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, attention.state.compressed_k_cache)
                     res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
                     if (index - 1) in self.context_layers:
                         self._capture_context_layer(capture, index - 1, res_a, res_b)
                     pending_prev = None
-                mixed_b, _ = attn_hc.mix_runtime(res_b, norm_b)
-                attention(mixed_b, qsa_b)
+                mixed_b, enc_b, _ = self._mix_attn_input(attn_hc, res_b, norm_b)
+                attention(mixed_b, qsa_b, input_encoded_bases=enc_b)
                 return residual, None
             if pending_prev is not None:
                 prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_a, prev_mlp_a, prev_inj_a, prev_res_b, prev_inj_b = pending_prev
                 res_a, norm_a = prev_mlp_hc.combine_norm_runtime(prev_res_a, prev_mlp_a, prev_inj_a)
                 if self.layer_outputs is not None:
                     self.layer_outputs[index - 1][:h].copy_(res_a)
-            mixed_a, attn_inj_a = attn_hc.mix_runtime(res_a, norm_a)
+            mixed_a, enc_a, attn_inj_a = self._mix_attn_input(attn_hc, res_a, norm_a)
             if not is_qsa:
-                out_a = attention(mixed_a, metadata=gdn_a)
+                out_a = attention(mixed_a, metadata=gdn_a, input_encoded_bases=enc_a)
                 if pending_prev is not None:
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, out_a)
                     att0_deps = (prev_mlp_b,)
                 else:
                     att0_deps = ()
             elif has_row_gather:
-                stage_a = attention.pre_gather_runtime(mixed_a, qsa_a)
+                stage_a = attention.pre_gather_runtime(mixed_a, qsa_a, input_encoded_bases=enc_a)
                 if pending_prev is not None:
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, stage_a.send)
                     gather_deps_a = (prev_mlp_b,)
@@ -1429,7 +1468,7 @@ class PreparedDecoder:
                 out_a = attention.post_gather_runtime(stage_a, gather_dependencies=gather_deps_a)
                 att0_deps = (out_a,)
             else:
-                out_a = attention(mixed_a, qsa_a)
+                out_a = attention(mixed_a, qsa_a, input_encoded_bases=enc_a)
                 if pending_prev is not None:
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, out_a)
                     att0_deps = (prev_mlp_b,)
@@ -1444,16 +1483,16 @@ class PreparedDecoder:
                 if (index - 1) in self.context_layers:
                     self._capture_context_layer(capture, index - 1, res_a, res_b)
                 pending_prev = None
-            mixed_b, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
+            mixed_b, enc_b, attn_inj_b = self._mix_attn_input(attn_hc, res_b, norm_b)
             if not is_qsa:
-                out_b = attention(mixed_b, metadata=gdn_b)
+                out_b = attention(mixed_b, metadata=gdn_b, input_encoded_bases=enc_b)
                 att_a = cr_att_0.finish(p_att_a, out_b)
             elif has_row_gather:
-                stage_b = attention.pre_gather_runtime(mixed_b, qsa_b)
+                stage_b = attention.pre_gather_runtime(mixed_b, qsa_b, input_encoded_bases=enc_b)
                 att_a = cr_att_0.finish(p_att_a, stage_b.send)
                 out_b = attention.post_gather_runtime(stage_b, gather_dependencies=(att_a,))
             else:
-                out_b = attention(mixed_b, qsa_b)
+                out_b = attention(mixed_b, qsa_b, input_encoded_bases=enc_b)
                 att_a = cr_att_0.finish(p_att_a, out_b)
 
             p_att_b = cr_att_1.start(out_b, dependencies=(att_a,))
@@ -1529,19 +1568,21 @@ class PreparedDecoder:
                     prefetched_mix = None
                 if prefetched_mix is not None:
                     mixed, injection = prefetched_mix
+                    enc_bases = None
                     prefetched_mix = None
                 else:
-                    mixed, injection = attn_hc.mix_runtime(residual, normalized)
+                    mixed, enc_bases, injection = self._mix_attn_input(attn_hc, residual, normalized)
                 if mlp_hc is None:
-                    attention(mixed, runtime.qsa)
+                    attention(mixed, runtime.qsa, input_encoded_bases=enc_bases)
                     normalized = None
                     break
                 if index % 4 != 3:
                     layer_records = None if records is None or index not in records.layers else records[index]
                     block = attention(mixed, records=layer_records, metadata=runtime.gdn,
-                                      partitions=getattr(runtime, "gdn_partitions", None))
+                                      partitions=getattr(runtime, "gdn_partitions", None),
+                                      input_encoded_bases=enc_bases)
                 else:
-                    block = attention(mixed, runtime.qsa)
+                    block = attention(mixed, runtime.qsa, input_encoded_bases=enc_bases)
                 if self.reductions:
                     block = self.reductions[index][0](block)
                 if getattr(attn_hc, "_triton_m1_combine_mix", None) is not None:

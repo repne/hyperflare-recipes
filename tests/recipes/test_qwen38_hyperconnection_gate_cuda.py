@@ -707,5 +707,91 @@ def test_prepared_mlp_fused_swiglu_mxfp8_compiled_parity(tokens, width):
     assert torch.equal(out_buf, bound_ref)
 
 
+@pytest.mark.parametrize("tokens", [128, 200, 4096])
+@torch.no_grad()
+def test_hc_gate_fused_mxfp8_compiled_parity(tokens):
+    """Fused BH=32 MXFP8 hyperconnection gate matches unfused b12x quantization bitwise."""
+    from b12x.quantization import mxfp8
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from hyperflare_recipes.recipes.qwen38.hyperconnection import HyperconnectionScratch, PreparedHyperconnection
+
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        pytest.skip("requires SM120/SM121 fused Triton hyperconnection gate")
+
+    module = _make_hc_module(device, has_injection=True, seed=303 + tokens)
+    gen = torch.Generator(device=device).manual_seed(303 + tokens)
+    residual = (torch.randn((tokens, 10240), generator=gen, device=device) * 0.25).bfloat16()
+    residual[-8:].zero_()
+
+    shapes = mxfp8.dense_rows_storage_shapes(tokens, 2560)
+    enc_bases_prep = (
+        torch.zeros(shapes[0], dtype=torch.float8_e4m3fn, device=device),
+        torch.full(shapes[1], 127, dtype=torch.uint8, device=device),
+        torch.full(shapes[2], 127, dtype=torch.uint8, device=device),
+    )
+    enc_prep = mxfp8.dense_rows_from_bases(*enc_bases_prep)
+
+    with RecordedPreparationSession(
+        device=device, checkpoint=f"test_hc_mx_{tokens}",
+        workload_schema=f"test_hc_mx_{tokens}",
+        numerical_policy="default", autotune_effort="off",
+    ) as session:
+        hc_ref = PreparedHyperconnection(
+            module, HyperconnectionScratch.allocate(tokens, device),
+            priming_state=torch.zeros((tokens, 10240), dtype=torch.bfloat16, device=device),
+            session=session, name="ref",
+        ).functional(session=session)
+        hc_mx = PreparedHyperconnection(
+            module, HyperconnectionScratch.allocate(tokens, device),
+            priming_state=torch.zeros((tokens, 10240), dtype=torch.bfloat16, device=device),
+            session=session, name="mxfp8", encoded_output=enc_prep,
+        ).functional(session=session)
+        assert hc_mx.emits_mxfp8
+        session.tune(show_progress=False)
+
+    ref_bf16, ref_inj = hc_ref.mix_runtime(residual)
+    ref_v = torch.empty(shapes[0], dtype=torch.float8_e4m3fn, device=device)
+    ref_sr = torch.empty(shapes[1], dtype=torch.uint8, device=device)
+    ref_sm = torch.full(shapes[2], 127, dtype=torch.uint8, device=device)
+    ref_enc = mxfp8.dense_rows_from_bases(ref_v, ref_sr, ref_sm)
+    qplan = mxfp8.plan(mxfp8.query_from_call(
+        ref_bf16, ref_enc.values, ref_enc.scale_rows, ref_enc.scale_mma, min_amax=0.0,
+    ))
+    mxfp8.quantize_dense_rows(ref_bf16, ref_v, ref_sr, ref_sm, plan=qplan)
+
+    out_v = torch.empty_like(ref_v)
+    out_sr = torch.empty_like(ref_sr)
+    out_sm = torch.empty_like(ref_sm)
+    out_inj_mx = torch.empty_like(ref_inj)
+
+    def run():
+        (v, sr, sm), inj_mx = hc_mx.mix_runtime(residual)
+        out_v.copy_(v)
+        out_sr.copy_(sr)
+        out_sm.copy_(sm)
+        out_inj_mx.copy_(inj_mx)
+
+    compiled = compile_forward(run)
+    compiled()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    out_v.zero_()
+    out_sr.zero_()
+    out_sm.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    graph.reset()
+
+    assert torch.equal(out_inj_mx, ref_inj)
+    assert torch.equal(out_v.view(torch.uint8), ref_v.view(torch.uint8))
+    assert torch.equal(out_sr, ref_sr)
+    assert torch.equal(out_sm, ref_sm)
+
+
+
 
 

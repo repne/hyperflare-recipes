@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 from b12x.gemm import hyperconnection_gate
+from b12x.gemm.blockscaled._quantize import _scale_offset
 from b12x.norm.hyperconnection import api as hc
 from b12x.preparation import FrozenMapping, PreparedCall
 
@@ -154,13 +155,108 @@ def _hc_gate_bptr_4acc(
     tl.store(OUT + m[:, None] * H + h[None, :], (total * (1.0 / S)).to(tl.bfloat16), mask)
 
 
+@triton.autotune(configs=[_BPTR_4ACC_CONFIG], key=[])
+@triton.jit(do_not_specialize=["ROWS"])
+def _hc_gate_bptr_4acc_mxfp8(
+    X,
+    WEIGHT,
+    NORM,
+    VALS,
+    SROWS,
+    SMMA,
+    ROWS,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    R: tl.constexpr,
+    BM: tl.constexpr,
+    BH: tl.constexpr,
+    BK: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    EVICT_NORM: tl.constexpr,
+):
+    """Pipelined 4-accumulator projection gate with inline block-32 MXFP8 quantization."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(ROWS, BM)
+    num_n = tl.cdiv(H, BH)
+    if GROUP_M > 1:
+        num_in_group = GROUP_M * num_n
+        group_id = pid // num_in_group
+        first_m = group_id * GROUP_M
+        group_size_m = tl.minimum(num_m - first_m, GROUP_M)
+        pid_m = first_m + ((pid % num_in_group) % group_size_m)
+        pid_n = (pid % num_in_group) // group_size_m
+    else:
+        pid_m = pid // num_n
+        pid_n = pid % num_n
+
+    m0 = pid_m * BM
+    h0 = pid_n * BH
+    x_ptr = tl.make_block_ptr(X, (ROWS, R), (R, 1), (m0, 0), (BM, BK), (1, 0))
+    w0_ptr = tl.make_block_ptr(WEIGHT + 0 * H * R, (R, H), (1, R), (0, h0), (BK, BH), (0, 1))
+    w1_ptr = tl.make_block_ptr(WEIGHT + 1 * H * R, (R, H), (1, R), (0, h0), (BK, BH), (0, 1))
+    w2_ptr = tl.make_block_ptr(WEIGHT + 2 * H * R, (R, H), (1, R), (0, h0), (BK, BH), (0, 1))
+    w3_ptr = tl.make_block_ptr(WEIGHT + 3 * H * R, (R, H), (1, R), (0, h0), (BK, BH), (0, 1))
+    acc0 = tl.zeros((BM, BH), dtype=tl.float32)
+    acc1 = tl.zeros((BM, BH), dtype=tl.float32)
+    acc2 = tl.zeros((BM, BH), dtype=tl.float32)
+    acc3 = tl.zeros((BM, BH), dtype=tl.float32)
+    for _ in range(R // BK):
+        x = tl.load(x_ptr, boundary_check=(0, 1), padding_option="zero")
+        acc0 = tl.dot(x, tl.load(w0_ptr, boundary_check=(0, 1), padding_option="zero"), acc0)
+        acc1 = tl.dot(x, tl.load(w1_ptr, boundary_check=(0, 1), padding_option="zero"), acc1)
+        acc2 = tl.dot(x, tl.load(w2_ptr, boundary_check=(0, 1), padding_option="zero"), acc2)
+        acc3 = tl.dot(x, tl.load(w3_ptr, boundary_check=(0, 1), padding_option="zero"), acc3)
+        x_ptr = tl.advance(x_ptr, (0, BK))
+        w0_ptr = tl.advance(w0_ptr, (BK, 0))
+        w1_ptr = tl.advance(w1_ptr, (BK, 0))
+        w2_ptr = tl.advance(w2_ptr, (BK, 0))
+        w3_ptr = tl.advance(w3_ptr, (BK, 0))
+
+    m_i32 = m0 + tl.arange(0, BM)
+    m = m_i32.to(tl.int64)
+    h = h0 + tl.arange(0, BH)
+    rmask = m_i32 < ROWS
+    mask = rmask[:, None] & (h[None, :] < H)
+    m_base = m[:, None] * (S * H)
+    if EVICT_NORM:
+        g0 = tl.sigmoid(acc0.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total = (g0 * tl.load(NORM + m_base + (0 * H + h)[None, :], mask, other=0.0, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g1 = tl.sigmoid(acc1.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total += (g1 * tl.load(NORM + m_base + (1 * H + h)[None, :], mask, other=0.0, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g2 = tl.sigmoid(acc2.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total += (g2 * tl.load(NORM + m_base + (2 * H + h)[None, :], mask, other=0.0, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g3 = tl.sigmoid(acc3.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total += (g3 * tl.load(NORM + m_base + (3 * H + h)[None, :], mask, other=0.0, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    else:
+        g0 = tl.sigmoid(acc0.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total = (g0 * tl.load(NORM + m_base + (0 * H + h)[None, :], mask, other=0.0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g1 = tl.sigmoid(acc1.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total += (g1 * tl.load(NORM + m_base + (1 * H + h)[None, :], mask, other=0.0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g2 = tl.sigmoid(acc2.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total += (g2 * tl.load(NORM + m_base + (2 * H + h)[None, :], mask, other=0.0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g3 = tl.sigmoid(acc3.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        total += (g3 * tl.load(NORM + m_base + (3 * H + h)[None, :], mask, other=0.0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+
+    # BH == 32 equals one MXFP8 quantization block per row at group index pid_n.
+    val_f32 = (total * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
+    amax = tl.max(tl.abs(val_f32), axis=1)
+    ratio = tl.where(amax > 0, amax / 448.0, 1.0)
+    exponent = tl.minimum(tl.maximum(tl.ceil(tl.log2(ratio)), -127.0), 127.0)
+    q = (val_f32 / tl.exp2(exponent)[:, None]).to(tl.float8e4nv)
+    tl.store(VALS + m[:, None] * H + h[None, :], q, mask)
+    groups: tl.constexpr = H // 32
+    byte = (exponent + 127).to(tl.uint8)
+    tl.store(SROWS + m * groups + pid_n, byte, rmask)
+    tl.store(SMMA + _scale_offset(m_i32, pid_n, groups), byte, rmask)
+
+
 def _is_sm12x(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
 
 
 class PreparedHyperconnectionGate:
     def __init__(self, source, weight, normalized, output, workspace, *, session, name,
-                 projected_down=None):
+                 projected_down=None, encoded_output=None):
         rows, rank = source.shape
         hidden = output.shape[1]
         streams, remainder = divmod(normalized.shape[1], hidden)
@@ -173,6 +269,7 @@ class PreparedHyperconnectionGate:
         self.implementation = None
         self._grid = None
         self._options = None
+        self.encoded_layout = None
 
         triton_eligible = (
             _is_sm12x(source.device)
@@ -193,7 +290,13 @@ class PreparedHyperconnectionGate:
             and projected_down.device == source.device
             and projected_down.stride(1) == 1
         )
-        if triton_eligible and rows == 1 and hidden % 2 == 0 and fused_source_ok:
+        if (
+            triton_eligible
+            and rows == 1
+            and hidden % 2 == 0
+            and fused_source_ok
+            and encoded_output is None
+        ):
             self.fuses_scaled_silu = True
             self.implementation = "triton_m1_gemv"
             self._grid = (hidden // 2, 1, 1)
@@ -208,7 +311,6 @@ class PreparedHyperconnectionGate:
             )
             return
         if triton_eligible and rows >= 64 and hidden % 32 == 0 and source.is_contiguous():
-            self.implementation = "triton_bptr_4acc"
             bm, bh, bk, gm = 64, 32, 32, 8
             self._grid = (triton.cdiv(rows, bm) * triton.cdiv(hidden, bh), 1, 1)
             self._options = {
@@ -221,6 +323,32 @@ class PreparedHyperconnectionGate:
                 "GROUP_M": gm,
                 "EVICT_NORM": rows >= 4096,
             }
+            if encoded_output is not None:
+                from b12x.quantization import mxfp8
+
+                if (
+                    not isinstance(encoded_output, mxfp8.MXFP8Rows)
+                    or encoded_output.values.shape != (rows, hidden)
+                    or encoded_output.values.device != source.device
+                ):
+                    raise ValueError("MXFP8 hyperconnection gate requires matching MXFP8Rows storage")
+                bases = (
+                    encoded_output.values,
+                    encoded_output.scale_rows.view(torch.uint8),
+                    mxfp8.dense_scale_storage(encoded_output.scale_mma),
+                )
+                self.implementation = "triton_bptr_4acc_mxfp8"
+                self.encoded_layout = tuple((tuple(base.shape), base.dtype) for base in bases)
+                warmup_triton(
+                    _hc_gate_bptr_4acc_mxfp8.fn,
+                    (source, weight, normalized, bases[0], bases[1], bases[2], rows),
+                    self._grid,
+                    num_warps=_BPTR_4ACC_CONFIG.num_warps,
+                    num_stages=_BPTR_4ACC_CONFIG.num_stages,
+                    **self._options,
+                )
+                return
+            self.implementation = "triton_bptr_4acc"
             warmup_triton(
                 _hc_gate_bptr_4acc.fn,
                 (source, weight, normalized, output, rows),
@@ -230,6 +358,8 @@ class PreparedHyperconnectionGate:
                 **self._options,
             )
             return
+        if encoded_output is not None:
+            raise ValueError("fused MXFP8 hyperconnection gate requires SM12x with rows >= 64, streams == 4, rank == 320")
 
         self.plan = hyperconnection_gate.plan(hyperconnection_gate.Query(
             max_rows=rows, rank=rank, hidden_size=hidden, streams=streams))
@@ -253,6 +383,18 @@ class PreparedHyperconnectionGate:
         return self
 
     def __call__(self, source, normalized):
+        if self.implementation == "triton_bptr_4acc_mxfp8":
+            mma_unpadded = source.shape[0] % 128 == 0
+            bases = tuple(
+                torch.empty(shape, dtype=dtype, device=normalized.device)
+                if index < 2 or mma_unpadded
+                else torch.full(shape, 127, dtype=dtype, device=normalized.device)
+                for index, (shape, dtype) in enumerate(self.encoded_layout)
+            )
+            torch.library.wrap_triton(_hc_gate_bptr_4acc_mxfp8)[self._grid](
+                source, self.weight, normalized, bases[0], bases[1], bases[2], source.shape[0], **self._options,
+            )
+            return bases
         output = torch.empty(self.output_shape, dtype=normalized.dtype, device=normalized.device)
         if self.implementation == "triton_m1_gemv":
             torch.library.wrap_triton(_hc_gate_m1_gemv)[self._grid](

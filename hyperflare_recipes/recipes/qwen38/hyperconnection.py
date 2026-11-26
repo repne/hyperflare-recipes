@@ -145,6 +145,7 @@ class PreparedHyperconnection:
         name: str,
         runtime=None,
         coordinator=None,
+        encoded_output=None,
     ) -> None:
         if module.hc_count != 4 or module.hidden_size != 2560:
             raise ValueError("Qwen hyperconnection requires four streams of width 2560")
@@ -170,13 +171,17 @@ class PreparedHyperconnection:
         self.down = UnquantizedProjection(scratch.normalized, packed_down_projection(module),
             down_output, session=session, name=f"{name}.down")
         if sharded:
+            if encoded_output is not None:
+                raise ValueError("sharded hyperconnections do not support fused MXFP8 gate outputs")
             self.gate = PreparedShardedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
                 scratch.normalized, scratch.block_input, scratch.gate_workspace, scratch.gate_logits,
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.gate")
         else:
             self.gate = PreparedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
                 scratch.normalized, scratch.block_input, scratch.gate_workspace,
-                session=session, name=f"{name}.gate", projected_down=scratch.projected_down)
+                session=session, name=f"{name}.gate", projected_down=scratch.projected_down,
+                encoded_output=encoded_output)
+        self.emits_mxfp8 = getattr(self.gate, "implementation", None) == "triton_bptr_4acc_mxfp8"
 
         caps = hc.Caps(device=device, max_tokens=self.tokens, hidden_size=2560, streams=4, lowrank=self.lowrank)
         self.plans = {}
