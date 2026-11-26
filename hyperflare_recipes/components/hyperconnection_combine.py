@@ -20,7 +20,7 @@ _M1_PARTIAL_GATE_CONFIG = triton.Config({}, num_warps=1, num_stages=2)
 
 
 @triton.autotune(configs=[_COMBINE_NORM_CONFIG], key=[])
-@triton.jit(do_not_specialize=["INJ_STRIDE", "SHARED_GATE_STRIDE"])
+@triton.jit(do_not_specialize=["INJ_STRIDE"])
 def _combine_norm_5x512(
     STATE,
     BLOCK,
@@ -31,7 +31,6 @@ def _combine_norm_5x512(
     COMBINED,
     NORMALIZED,
     INJ_STRIDE,
-    SHARED_GATE_STRIDE,
     EPS: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -57,7 +56,7 @@ def _combine_norm_5x512(
     scale = 2.0 * tl.sigmoid(logit * (1.0 / S))
 
     if FUSE_MLP:
-        sg = tl.sigmoid(tl.load(SHARED_GATE + tok * SHARED_GATE_STRIDE).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        sg = tl.sigmoid(tl.load(SHARED_GATE + tok).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
         b0 = (
             tl.load(BLOCK + b_base + k).to(tl.float32)
             + (tl.load(PROJ_SHARED + b_base + k).to(tl.float32) * sg).to(tl.bfloat16).to(tl.float32)
@@ -177,7 +176,6 @@ def warmup_combine_norm(
             combined,
             normalized,
             injection_logits.stride(0),
-            shared_gate.stride(0),
         ),
         grid,
         num_warps=_COMBINE_NORM_CONFIG.num_warps,
@@ -212,7 +210,6 @@ def launch_combine_norm(
         combined,
         normalized,
         injection_logits.stride(0),
-        gate.stride(0),
         **options,
     )
     return combined, normalized

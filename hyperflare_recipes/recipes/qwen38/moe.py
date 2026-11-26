@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import weakref
 
 import torch
 from b12x.gemm import blockscaled
@@ -20,80 +19,11 @@ from hyperflare_recipes.components.mlp import PreparedMLP
 from hyperflare_recipes.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
 from hyperflare_recipes.components.weights import MLPWeights
 from .checkpoint_schema import TEXT_PREFIX
-from ignition.preparation.persistent import persistent_zeros
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
 from .weights import QwenWeightLoader
 from ignition.preparation.rebuild_manifest import weight_container
-
-# 16-aligned packed width for router (512) + shared_expert_gate (1) so BF16 GEMM
-# retains tensor-core tiling while computing both outputs in one projection launch.
-_PACKED_ROUTER_GATE_ROWS = 528
-_PACKED_ROUTER_GATE_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
-
-
-def packed_router_gate(weights: QwenMoeWeights) -> torch.Tensor:
-    """Return one 16-aligned ``[528, 2560]`` BF16 weight packing ``router`` and ``shared.gate``."""
-    router, gate = weights.router, weights.shared.gate
-    if (
-        router.is_contiguous()
-        and gate.is_contiguous()
-        and router.dtype == gate.dtype
-        and router.device == gate.device
-        and router.untyped_storage().data_ptr() == gate.untyped_storage().data_ptr()
-        and gate.storage_offset() == router.storage_offset() + 512 * 2560
-        and router.storage_offset() + _PACKED_ROUTER_GATE_ROWS * 2560
-        <= router.untyped_storage().size() // router.element_size()
-    ):
-        return router.as_strided((_PACKED_ROUTER_GATE_ROWS, 2560), (2560, 1))
-    key = (id(router), router.data_ptr(), gate.data_ptr())
-    cached = _PACKED_ROUTER_GATE_CACHE.get(key)
-    if cached is not None and cached.device == router.device and cached.dtype == router.dtype:
-        return cached
-    packed = persistent_zeros((_PACKED_ROUTER_GATE_ROWS, 2560), dtype=router.dtype, device=router.device)
-    with torch.no_grad():
-        packed[:512].copy_(router)
-        packed[512:513].copy_(gate)
-    _PACKED_ROUTER_GATE_CACHE[key] = packed
-    weakref.finalize(router, _PACKED_ROUTER_GATE_CACHE.pop, key, None)
-    return packed
-
-
-class _RouterSliceProjection:
-    """Expose the 512 router columns of a packed ``[528, 2560]`` router+gate projection."""
-
-    def __init__(self, projection: UnquantizedProjection):
-        self.projection = projection
-
-    @property
-    def plan(self):
-        return self.projection.plan
-
-    def functional(self, *, session):
-        self.projection.functional(session=session)
-        return self
-
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        return self.projection(source)[:, :512]
-
-
-class _GateSliceProjection:
-    """Expose the 1 shared-gate column of a packed ``[528, 2560]`` router+gate projection."""
-
-    def __init__(self, projection: UnquantizedProjection):
-        self.projection = projection
-
-    @property
-    def plan(self):
-        return self.projection.plan
-
-    def functional(self, *, session):
-        self.projection.functional(session=session)
-        return self
-
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        return self.projection(source)[:, 512:513]
 
 
 @weight_container(('gate_up', 'down', 'gate'))
@@ -104,7 +34,7 @@ class SharedExpertWeights:
     gate: torch.Tensor
 
     @classmethod
-    def load(cls, loader: QwenWeightLoader, layer: int, *, gate: torch.Tensor | None = None) -> SharedExpertWeights:
+    def load(cls, loader: QwenWeightLoader, layer: int) -> SharedExpertWeights:
         if type(layer) is not int or not 0 <= layer < 48:
             raise ValueError("decoder layer must be an integer in [0, 48)")
         prefix = f"{TEXT_PREFIX}.layers.{layer}.mlp"
@@ -113,7 +43,7 @@ class SharedExpertWeights:
             loader.load_linear_group(tuple(f"{prefix}.shared_expert.{name}" for name in ("gate_proj", "up_proj")),
                                     row_ranges=(extent, extent)),
             loader.load_linear(f"{prefix}.shared_expert.down_proj", columns=extent),
-            loader.load_tensor(f"{prefix}.shared_expert_gate.weight") if gate is None else gate,
+            loader.load_tensor(f"{prefix}.shared_expert_gate.weight"),
         )
 
 
@@ -127,19 +57,9 @@ class QwenMoeWeights:
 
     @classmethod
     def load(cls, loader: QwenWeightLoader, layer: int, *, scale_scratch=None) -> QwenMoeWeights:
-        prefix = f"{TEXT_PREFIX}.layers.{layer}.mlp"
-        router_src, gate_src = loader.load_tensors(
-            (f"{prefix}.gate.weight", f"{prefix}.shared_expert_gate.weight"),
-            temporary=True,
-        )
-        packed = persistent_zeros((_PACKED_ROUTER_GATE_ROWS, 2560), dtype=router_src.dtype, device=router_src.device)
-        with torch.no_grad():
-            packed[:512].copy_(router_src)
-            packed[512:513].copy_(gate_src)
-        del router_src, gate_src
-        shared = SharedExpertWeights.load(loader, layer, gate=packed[512:513])
+        shared = SharedExpertWeights.load(loader, layer)
         return cls(
-            packed[:512],
+            loader.load_tensor(f"{TEXT_PREFIX}.layers.{layer}.mlp.gate.weight"),
             loader.load_experts(layer, scale_scratch=scale_scratch),
             shared,
             experts_a4_prefill=loader.force_moe_decode_a16,
@@ -199,7 +119,7 @@ class PreparedSharedExpert(PreparedMLP):
 
     def __init__(self, source, weights: SharedExpertWeights, *, session: PreparationSession, name: str,
                  scratch: SharedExpertScratch | None = None, projection_workspace: ScratchArena | torch.Tensor | None = None,
-                 gate_source: torch.Tensor | None = None, gate_projection=None):
+                 gate_source: torch.Tensor | None = None):
         if source.ndim != 2 or source.shape[1] != 2560 or source.dtype != torch.bfloat16:
             raise ValueError("shared expert input must be BF16 [tokens, 2560]")
         def geometry(weight):
@@ -224,14 +144,11 @@ class PreparedSharedExpert(PreparedMLP):
             self.intermediate, self.projected, session=session, name=name,
             workspace=projection_workspace, activation_mode="auto")
         self.output = scratch.output
-        if gate_projection is not None:
-            self.gate_projection = gate_projection
-        else:
-            gate_input = source if gate_source is None else gate_source
-            if gate_input.ndim != 2 or gate_input.shape[1] != 2560 or gate_input.dtype != torch.bfloat16 or gate_input.shape[0] > tokens:
-                raise ValueError("shared expert gate input must be BF16 [<=tokens, 2560]")
-            self.gate_projection = UnquantizedProjection(gate_input, weights.gate, self.gate_logits[:gate_input.shape[0]],
-                session=session, name=f"{name}.shared_gate")
+        gate_input = source if gate_source is None else gate_source
+        if gate_input.ndim != 2 or gate_input.shape[1] != 2560 or gate_input.dtype != torch.bfloat16 or gate_input.shape[0] > tokens:
+            raise ValueError("shared expert gate input must be BF16 [<=tokens, 2560]")
+        self.gate_projection = UnquantizedProjection(gate_input, weights.gate, self.gate_logits[:gate_input.shape[0]],
+            session=session, name=f"{name}.shared_gate")
 
     def functional(self, *, session):
         super().functional(session=session)
@@ -281,19 +198,12 @@ class PreparedQwenMoe:
         if route_in.ndim != 2 or route_in.shape[1] != 2560 or route_in.dtype != torch.bfloat16 or route_in.shape[0] > source.shape[0]:
             raise ValueError("Qwen MoE shard source must be BF16 [<=tokens, 2560]")
         route_tokens = route_in.shape[0]
-        self.router_gate_logits = torch.zeros(
-            (route_tokens, _PACKED_ROUTER_GATE_ROWS), dtype=torch.bfloat16, device=source.device,
-        )
-        self.router_gate_projection = UnquantizedProjection(
-            route_in, packed_router_gate(weights), self.router_gate_logits,
-            session=session, name=f"{name}.router_gate",
-        )
-        self.router_projection = _RouterSliceProjection(self.router_gate_projection)
-        self.routing = PreparedRouter(self.router_gate_logits[:, :512], self.router.rows(route_tokens),
+        self.router_projection = UnquantizedProjection(route_in, weights.router, self.router_logits[:route_tokens],
+            session=session, name=f"{name}.router")
+        self.routing = PreparedRouter(self.router_logits[:route_tokens], self.router.rows(route_tokens),
             session=session, name=f"{name}.route_topk")
         self.shared = PreparedSharedExpert(source, weights.shared, session=session, name=f"{name}.shared",
-            scratch=scratch.shared, projection_workspace=projection_workspace, gate_source=shard_source,
-            gate_projection=_GateSliceProjection(self.router_gate_projection))
+            scratch=scratch.shared, projection_workspace=projection_workspace, gate_source=shard_source)
         self.experts = PreparedRoutedExperts(source, weights.experts, self.router.ids,
             self.router.weights, self.routed_output, session=session, name=f"{name}.experts", workspace=workspace,
             router_plan=self.routing.plan, a4_prefill=prefill and weights.experts_a4_prefill)
@@ -301,8 +211,8 @@ class PreparedQwenMoe:
         if (shard_source is None and source.shape[0] <= 256 and isinstance(workspace, ScratchArena)
                 and workspace is projection_workspace and workspace.overlap):
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
-                parallel_plans=(self.router_gate_projection.plan, self.routing.plan, self.experts.plan),
-                gate_projection=None, session=session, workspace=workspace)
+                parallel_plans=(self.router_projection.plan, self.routing.plan, self.experts.plan),
+                gate_projection=self.shared.gate_projection, session=session, workspace=workspace)
 
             def finalize_overlap():
                 self.concurrent_shared.defer_launch = (
@@ -311,21 +221,22 @@ class PreparedQwenMoe:
             register_finalizer(session, finalize_overlap, workspace=workspace)
 
     def functional(self, *, session):
-        self.router_gate_projection.functional(session=session)
+        self.router_projection.functional(session=session)
         self.routing.functional(session=session)
         self.experts.functional(session=session)
         if self.concurrent_shared is None:
             self.shared.functional(session=session)
         else:
             self.concurrent_shared.functional(session=session)
-        self.source = self.scratch = self.router_logits = self.router = self.router_gate_logits = None
+        self.source = self.scratch = self.router_logits = self.router = None
         self.routed_output = self.output = None
         return self
 
     def route_shard_runtime(self, shard_source: torch.Tensor):
-        packed = self.router_gate_projection(shard_source)
-        routes = self.routing(packed[:, :512])
-        return routes.ids, routes.weights, packed[:, 512:513]
+        logits = self.router_projection(shard_source)
+        routes = self.routing(logits)
+        gate = self.shared.gate_projection(shard_source)
+        return routes.ids, routes.weights, gate
 
     def run_gathered_runtime(self, source: torch.Tensor, route_ids: torch.Tensor,
                              route_weights: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -342,33 +253,35 @@ class PreparedQwenMoe:
         if getattr(self.experts, "reduces_into_shared", False):
             raise ValueError("parts_runtime requires separate routed and shared expert outputs")
         if self.concurrent_shared is None:
-            projected = self.shared.project_mlp_runtime(source)
+            projected, gate = self.shared.project_runtime(source)
         else:
             pending = self.concurrent_shared.start(source)
-        packed = self.router_gate_projection(source)
-        routes = self.routing(packed[:, :512])
+        logits = self.router_projection(source)
+        routes = self.routing(logits)
         routed = self.experts(source, routes.ids, routes.weights)
         if self.concurrent_shared is not None:
             projected = self.concurrent_shared.finish(pending, routed)
-        return routed, projected, packed[:, 512:513]
+            gate = pending.gate
+        return routed, projected, gate
 
     def _functional(self, source):
         if self.concurrent_shared is None:
-            projected = self.shared.project_mlp_runtime(source)
+            projected, gate = self.shared.project_runtime(source)
         else:
             pending = self.concurrent_shared.start(source)
-        packed = self.router_gate_projection(source)
-        routes = self.routing(packed[:, :512])
-        gate = packed[:, 512:513]
+        logits = self.router_projection(source)
+        routes = self.routing(logits)
         if getattr(self.experts, "reduces_into_shared", False):
             staged = self.experts.stage_rows(source, routes.ids, routes.weights)
             if self.concurrent_shared is not None:
                 projected = self.concurrent_shared.finish(pending, staged.rows)
+                gate = pending.gate
             shared = self.shared.finish_runtime(projected, gate)
             return self.experts.reduce(shared, staged=staged)
         routed = self.experts(source, routes.ids, routes.weights)
         if self.concurrent_shared is not None:
             projected = self.concurrent_shared.finish(pending, routed)
+            gate = pending.gate
         return self.shared.finish_runtime(projected, gate, routed)
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
