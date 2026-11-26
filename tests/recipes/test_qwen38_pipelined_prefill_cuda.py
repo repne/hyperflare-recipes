@@ -515,6 +515,7 @@ def _tp2_pipelined_prefill_worker(rank: int, world: int, port: int, tokens: int,
         )
         assert pipe_decoder.pipelined_prefill is True
         assert pipe_decoder.row_shard_dma is True
+        assert pipe_decoder.split_att_rs_1 is True
         assert pipe_decoder.layer_attn_mxfp8 == (False, False, True, True, False)
         s = pipe_decoder.state
         pipe_decoder.capture_context(

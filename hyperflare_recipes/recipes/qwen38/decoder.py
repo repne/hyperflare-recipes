@@ -10,6 +10,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
+import triton
+import triton.language as tl
 
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
@@ -18,6 +20,7 @@ from ignition.preparation.host_memory import device_memory_info
 from ignition.preparation.persistent import allocated_tensor_bytes
 from .checkpoint_schema import TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
+from ignition.preparation.triton import warmup_triton
 
 from .hyperconnection import packed_down_projection, hyperconnection_extents
 from .model import create_model_tree
@@ -288,6 +291,41 @@ def _moe_plans(moe) -> tuple:
     return _moe_shard_plans(moe) + _moe_compute_plans(moe)
 
 
+_AUX_COPY_CONFIG = triton.Config({}, num_warps=4, num_stages=2)
+_AUX_COPY_CTAS = 32
+
+
+@triton.autotune(configs=[_AUX_COPY_CONFIG], key=[])
+@triton.jit(do_not_specialize=["ROWS"])
+def _aux_copy_rows_2560_kernel(SRC, DST, ROWS, NUM_CTAS: tl.constexpr):
+    """Copy [ROWS, 2560] BF16 prefix rows on the auxiliary stream using a bounded CTA count."""
+    pid = tl.program_id(0)
+    k = tl.arange(0, 512)
+    r = pid
+    while r < ROWS:
+        base = r.to(tl.int64) * 2560
+        tl.store(DST + base + k, tl.load(SRC + base + k))
+        tl.store(DST + base + 512 + k, tl.load(SRC + base + 512 + k))
+        tl.store(DST + base + 1024 + k, tl.load(SRC + base + 1024 + k))
+        tl.store(DST + base + 1536 + k, tl.load(SRC + base + 1536 + k))
+        tl.store(DST + base + 2048 + k, tl.load(SRC + base + 2048 + k))
+        r += NUM_CTAS
+
+
+@torch.library.custom_op("flare_recipes::qwen38_aux_copy_prefix", mutates_args=("dst",))
+def _aux_copy_prefix(src: torch.Tensor, dst: torch.Tensor, stream: int) -> None:
+    rows = src.shape[0]
+    auxiliary = torch.cuda.ExternalStream(stream, device=src.device)
+    auxiliary.wait_stream(torch.cuda.current_stream(src.device))
+    with torch.cuda.stream(auxiliary):
+        _aux_copy_rows_2560_kernel[(_AUX_COPY_CTAS,)](src, dst, rows, NUM_CTAS=_AUX_COPY_CTAS)
+
+
+@_aux_copy_prefix.register_fake
+def _fake_aux_copy_prefix(src: torch.Tensor, dst: torch.Tensor, stream: int) -> None:
+    pass
+
+
 def _mxfp8_scale_mma(scale_rows_2d: torch.Tensor, hidden: int) -> torch.Tensor:
     """Swizzle contiguous [rows, hidden // 32] UE8M0 scale rows into b12x MMA tile layout."""
     m_tiles, k_tiles = scale_rows_2d.shape[0] // 128, hidden // 128
@@ -450,6 +488,8 @@ class PreparedDecoder:
         self._single_row_residual = False
         self._needs_full_residual = needs_any_residual
         self.row_shard_dma = False
+        self.split_att_rs_1 = False
+        self.world_size = 1 if shard is None else shard.world_size
         self.shard_tokens = 0
         self.shard_rows_a = self.shard_rows_b = None
         self.shard_offset_a = self.shard_offset_b = None
@@ -490,6 +530,20 @@ class PreparedDecoder:
                 ):
                     self.row_shard_dma = True
                     self.shard_tokens = st
+                    self.split_att_rs_1 = (
+                        st >= 1024
+                        and st % 2 == 0
+                        and PreparedReduceScatter.fits(runtime, scratch.hidden[:half // 2], scratch.hidden[:st // 2])
+                    )
+                    if self.split_att_rs_1:
+                        warmup_triton(
+                            _aux_copy_rows_2560_kernel.fn,
+                            (scratch.hidden[:st // 2], scratch.hidden[:st], st // 2),
+                            (_AUX_COPY_CTAS, 1, 1),
+                            num_warps=_AUX_COPY_CONFIG.num_warps,
+                            num_stages=_AUX_COPY_CONFIG.num_stages,
+                            NUM_CTAS=_AUX_COPY_CTAS,
+                        )
                     ffn_local_packed, ffn_full_packed = cand_ffn_local, cand_ffn_full
                     from ignition.preparation.persistent import persistent_copy
 
@@ -676,7 +730,7 @@ class PreparedDecoder:
                     self.pipelined_reductions.append((
                         ConcurrentGatherShards(ag_0, workspace=workspaces, session=session, parallel_plans=attn_hc_plans),
                         ConcurrentGatherShards(ag_1, workspace=workspaces, session=session, parallel_plans=attn_plans),
-                        None, None, None, None, None, None,
+                        None, None, None, None, None, None, None,
                     ))
                 elif self.pipelined_prefill:
                     self.pipelined_reductions.append((None, None, None, None))
@@ -726,8 +780,17 @@ class PreparedDecoder:
                     coordinator=coordinator, name=f"{prefix}.attn_gather.1")
                 att_rs_0 = PreparedReduceScatter(attention.scratch.output, shard_scratch.hidden,
                     runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.attention_rs.0")
-                att_rs_1 = PreparedReduceScatter(attention.scratch.output, shard_scratch.hidden,
-                    runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.attention_rs.1")
+                if self.split_att_rs_1:
+                    half_in = half // 2
+                    half_st = self.shard_tokens // 2
+                    att_rs_1 = PreparedReduceScatter(attention.scratch.output[:half_in], shard_scratch.hidden[:half_st],
+                        runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.attention_rs.1a")
+                    att_rs_1b = PreparedReduceScatter(attention.scratch.output[:half_in], shard_scratch.hidden[:half_st],
+                        runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.attention_rs.1b")
+                else:
+                    att_rs_1 = PreparedReduceScatter(attention.scratch.output, shard_scratch.hidden,
+                        runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.attention_rs.1")
+                    att_rs_1b = None
                 ffn_gather_0 = PreparedGatherShards(ffn_local_packed, ffn_full_packed,
                     runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.ffn_gather.0")
                 ffn_gather_1 = PreparedGatherShards(ffn_local_packed, ffn_full_packed,
@@ -757,6 +820,8 @@ class PreparedDecoder:
                         parallel_plans=shard_prep_plans),
                     ConcurrentReduceScatter(mlp_rs_1, workspace=workspaces, session=session,
                         parallel_plans=_hc_plans(mlp_hc)),
+                    None if att_rs_1b is None else ConcurrentReduceScatter(att_rs_1b, workspace=workspaces,
+                        session=session, parallel_plans=moe_compute_plans),
                 ))
             elif self.pipelined_prefill:
                 from ignition.components.collectives import ConcurrentAllReduce, PreparedAllReduce
@@ -870,7 +935,7 @@ class PreparedDecoder:
                         workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
                         workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
                     continue
-                (cr_ag_0, _, _, _, cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1) = self.pipelined_reductions[index]
+                (cr_ag_0, _, _, _, cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1, _) = self.pipelined_reductions[index]
                 if mlp_hc is not None:
                     if "combine_norm" in attn_hc.plans:
                         attn_cn = attn_hc.plans["combine_norm"]
@@ -1222,7 +1287,7 @@ class PreparedDecoder:
         for index in range(1, len(self.layers)):
             attn_hc, attention, mlp_hc, moe = self.layers[index]
             (_, cr_ag_1, cr_att_0, cr_att_1,
-             cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1) = self.pipelined_reductions[index]
+             cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1, cr_att_1b) = self.pipelined_reductions[index]
             is_qsa = index % 4 == 3
             has_row_gather = is_qsa and attention.sharded is not None and attention.sharded.mode == "row"
             src_a_att, enc_a_att = self._unpack_attn_gathered(index, attn_a_full)
@@ -1281,7 +1346,12 @@ class PreparedDecoder:
                 out_b = attention.finish_sequence_runtime(
                     *proj_b[:4], qkvz=proj_b[4], ba=proj_b[5], metadata=gdn_b,
                 )
-                ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
+                if cr_att_1b is not None:
+                    out_b_chunks = out_b.view(self.world_size, 2, self.shard_tokens // 2, 2560).transpose(0, 1).contiguous()
+                    ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b_chunks)
+                else:
+                    out_b_chunks = None
+                    ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
             elif has_row_gather:
                 # Step 1: overlap half-A QKV/selection with previous layer's half-B MoE RS, then gather
                 # QSA group IDs with zero DMA in flight to avoid PCIe contention.
@@ -1316,7 +1386,12 @@ class PreparedDecoder:
                 ffn_a_send = self._prepare_ffn_shard(moe, mixed_a_sh)
                 p_ffn_a = cr_ffn_0.start(ffn_a_send, dependencies=(gathered_b, ffn_a_send))
                 out_b = attention.attend_project_runtime(stage_b, gathered_b)
-                ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
+                if cr_att_1b is not None:
+                    out_b_chunks = out_b.view(self.world_size, 2, self.shard_tokens // 2, 2560).transpose(0, 1).contiguous()
+                    ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b_chunks)
+                else:
+                    out_b_chunks = None
+                    ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
             else:
                 out_a = attention(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
                 if pending_prev_b is not None:
@@ -1342,14 +1417,36 @@ class PreparedDecoder:
                 ffn_a_send = self._prepare_ffn_shard(moe, mixed_a_sh)
                 p_ffn_a = cr_ffn_0.start(ffn_a_send, dependencies=(att_a, ffn_a_send))
                 ffn_a_full = cr_ffn_0.finish(p_ffn_a, ffn_a_send)
+                out_b_chunks = (
+                    out_b.view(self.world_size, 2, self.shard_tokens // 2, 2560).transpose(0, 1).contiguous()
+                    if cr_att_1b is not None else None
+                )
 
             # Step 5: overlap half-B attention RS with half-A MoE.
-            p_att_b = cr_att_1.start(out_b, dependencies=(ffn_a_full,))
-            moe_a = self._run_ffn_gathered(moe, ffn_a_full)
-            att_b = cr_att_1.finish(p_att_b, moe_a)
-
-            # Step 6: overlap half-A MoE RS with half-B FFN shard preparation.
-            p_mlp_a = cr_mlp_0.start(moe_a, dependencies=(att_b,))
+            # When split_att_rs_1 is active, splitting out_b into two half-size reduce-scatters
+            # lets chunk-0 piece-0 DMA finish before A4_fc1 (grid=188) launches, and staging
+            # chunk-0's output prefix on the auxiliary stream keeps chunk-1's flag-wait kernel
+            # behind A4_fc2 (grid=188), avoiding CWD head-of-line starvation on both MoE GEMMs.
+            if cr_att_1b is not None:
+                half_in = self.half_tokens // 2
+                half_st = self.shard_tokens // 2
+                att_b = torch.empty((self.shard_tokens, 2560), dtype=torch.bfloat16, device=out_b.device)
+                p_att_b0 = cr_att_1.start(out_b_chunks[0].view(half_in, 2560), dependencies=(ffn_a_full,))
+                _aux_copy_prefix(p_att_b0.output, att_b, cr_att_1.stream_handle)
+                p_att_b1 = cr_att_1b.start(out_b_chunks[1].view(half_in, 2560),
+                                           dependencies=(ffn_a_full, att_b))
+                moe_a = self._run_ffn_gathered(moe, ffn_a_full)
+                att_b_0 = cr_att_1.finish(p_att_b0, moe_a)
+                att_b_1 = cr_att_1b.finish(p_att_b1, att_b_0)
+                # Step 6: overlap half-A MoE RS with half-B FFN shard preparation.
+                p_mlp_a = cr_mlp_0.start(moe_a, dependencies=(att_b_0, att_b_1))
+                att_b[half_st:].copy_(att_b_1)
+            else:
+                p_att_b = cr_att_1.start(out_b, dependencies=(ffn_a_full,))
+                moe_a = self._run_ffn_gathered(moe, ffn_a_full)
+                att_b = cr_att_1.finish(p_att_b, moe_a)
+                # Step 6: overlap half-A MoE RS with half-B FFN shard preparation.
+                p_mlp_a = cr_mlp_0.start(moe_a, dependencies=(att_b,))
             res_b, norm_b = attn_hc.combine_norm_runtime(res_b, att_b, attn_inj_b)
             mixed_b_sh, mlp_inj_b = mlp_hc.mix_runtime(res_b, norm_b)
             ffn_b_send = self._prepare_ffn_shard(moe, mixed_b_sh)
