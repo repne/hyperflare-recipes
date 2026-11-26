@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA parity tests for SM120/SM121 Triton hyperconnection gate kernels."""
+"""CUDA parity tests for SM120 Triton hyperconnection gate kernels."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def test_prepared_hyperconnection_gate_matches_reference(rows: int, strided: boo
             session.tune(show_progress=False)
 
         cap = torch.cuda.get_device_capability(device)
-        if cap in ((12, 0), (12, 1)):
+        if cap == (12, 0):
             if rows == 1:
                 assert gate.implementation == "triton_m1_gemv" and gate.fuses_scaled_silu
             elif rows >= 64:
@@ -221,7 +221,7 @@ def test_triton_combine_norm_compiled_parity(rows: int, fuse_mlp: bool):
         following.functional(session=session)
         session.tune(show_progress=False)
 
-        if torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+        if torch.cuda.get_device_capability(device) == (12, 0):
             if fuse_mlp:
                 assert first._triton_combine_norm_mlp is not None
             else:
@@ -294,11 +294,12 @@ def test_triton_m1_combine_mix_compiled_parity(has_next_injection: bool, fuse_ml
         following.functional(session=session)
         session.tune(show_progress=False)
 
-        if torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+        if torch.cuda.get_device_capability(device) == (12, 0):
             if fuse_mlp:
                 assert first._triton_m1_combine_mix_mlp is not None
             else:
                 assert first._triton_m1_combine_mix is not None
+            assert "combine_norm" not in first.plans
 
         comb_buf = torch.empty_like(residual)
         mix_buf = torch.empty((1, 2560), dtype=torch.bfloat16, device=device)
@@ -324,7 +325,7 @@ def test_triton_m1_combine_mix_compiled_parity(has_next_injection: bool, fuse_ml
             torch.testing.assert_close(inj_buf, expected_next_inj, rtol=2e-2, atol=2e-2)
 
 
-def test_prepared_decoder_m1_combine_mix_compiled_parity():
+def test_prepared_decoder_m1_combine_mix_compiled_parity(monkeypatch):
     """4-layer M=1 compiled decode with fused combine_mix matches unfused combine_norm + mix across PLE and final_mixer."""
     from hyperflare_recipes.components.parallel import TensorParallelShard
     from hyperflare_recipes.recipes.qwen38.attention import QSAState, RotaryTables
@@ -424,11 +425,17 @@ def test_prepared_decoder_m1_combine_mix_compiled_parity():
             session.register_scratch(arena)
             ref_scratch = DecoderScratch.allocate(1, device, sample_rows=1, world_size=1)
             ref_state = PreparedDecoderState(ref_in, ref_req, ref_pool, tokens=1, rows=1, mode="decode")
+            # Prepare ref_dec through the unfused combine_norm + mix_runtime path.
+            monkeypatch.setattr(
+                "hyperflare_recipes.recipes.qwen38.hyperconnection.supports_m1_combine_mix",
+                lambda *args, **kwargs: False,
+            )
             ref_dec = PreparedDecoder(
                 weights, ref_scratch, ref_state, ref_cache, rotary, table, arena,
                 ref_comp, frame, sequence, session=session, name="ref_m1",
                 max_cache_pages=num_pages, sample=True,
             )
+            monkeypatch.undo()
             fused_scratch = DecoderScratch.allocate(1, device, sample_rows=1, world_size=1)
             fused_state = PreparedDecoderState(fused_in, fused_req, fused_pool, tokens=1, rows=1, mode="decode")
             fused_dec = PreparedDecoder(
@@ -442,18 +449,15 @@ def test_prepared_decoder_m1_combine_mix_compiled_parity():
             fused_dec.release_outputs()
             session.tune(show_progress=False)
 
-            # Disable fused combine_mix only on ref_dec to compare against unfused combine_norm + mix_runtime.
-            for attn_hc, _, mlp_hc, _ in ref_dec.layers:
-                attn_hc._triton_m1_combine_mix = None
-                attn_hc._triton_m1_combine_mix_mlp = None
-                mlp_hc._triton_m1_combine_mix = None
-                mlp_hc._triton_m1_combine_mix_mlp = None
-
-            if torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+            if torch.cuda.get_device_capability(device) == (12, 0):
+                assert "combine_norm" in ref_dec.layers[0][0].plans
                 assert fused_dec.layers[0][0]._triton_m1_combine_mix is not None
+                assert "combine_norm" not in fused_dec.layers[0][0].plans
                 assert getattr(fused_dec.layers[0][2], "_triton_m1_combine_mix_mlp", None) is None
                 assert fused_dec.layers[1][2]._triton_m1_combine_mix_mlp is not None
+                assert "combine_norm" not in fused_dec.layers[1][2].plans
                 assert fused_dec.layers[3][2]._triton_m1_combine_mix_mlp is not None
+                assert "combine_norm" not in fused_dec.layers[3][2].plans
 
             ref_fwd = PreparedDecoderForward(ref_dec)
             fused_fwd = PreparedDecoderForward(fused_dec)
@@ -550,8 +554,8 @@ def test_tiled_combine_down_silu_compiled_parity(tokens, fuse_mlp, has_next_inj)
     from hyperflare_recipes.components.linear import UnquantizedProjection
 
     device = torch.device("cuda:0")
-    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
-        pytest.skip("requires SM120/SM121 fused tiled combine_norm + down kernel")
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        pytest.skip("requires SM120 fused tiled combine_norm + down kernel")
 
     gen = torch.Generator(device=device).manual_seed(707 + tokens + int(fuse_mlp) * 10 + int(has_next_inj))
     state = (torch.randn((tokens, 10240), generator=gen, device=device) * 0.2).bfloat16()
@@ -642,4 +646,24 @@ def test_tiled_combine_down_silu_compiled_parity(tokens, fuse_mlp, has_next_inj)
     if has_next_inj:
         inj_rel = (out_inj.float() - ref_inj_out.float()).norm() / ref_inj_out.float().norm().clamp(min=1e-8)
         assert inj_rel < 2e-3, f"inj_rel={inj_rel}"
+
+
+def test_sm120_hyperconnection_triton_guards_reject_sm103_and_sm121(monkeypatch):
+    """SM120-tuned Triton hyperconnection helpers opt out on SM103 and SM121."""
+    from hyperflare_recipes.components.hyperconnection_combine import (
+        supports_m1_combine_mix,
+        supports_tiled_combine_down,
+        supports_triton_combine_norm,
+    )
+    from hyperflare_recipes.components.hyperconnection_gate import _is_sm120
+
+    device = torch.device("cuda:0")
+    down_w = torch.empty((336, 10240), dtype=torch.bfloat16, device=device)
+    for cap, expected in (((10, 3), False), ((12, 1), False), ((12, 0), True)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _dev, c=cap: c)
+        assert _is_sm120(device) is expected
+        assert supports_triton_combine_norm(2048, device, fuse_mlp=False) is expected
+        assert supports_m1_combine_mix(1, 1, 320, device, following_gate_impl="triton_m1_gemv") is expected
+        assert supports_tiled_combine_down(4100, 4100, 320, down_w, device, following_fuses_scaled_silu=False) is expected
+
 

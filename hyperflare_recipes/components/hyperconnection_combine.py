@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM120/SM121 token-major Triton hyperconnection combine-norm kernels."""
+"""SM120 token-major Triton hyperconnection combine-norm kernels."""
 
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ def supports_triton_combine_norm(
     min_tokens = 2 if fuse_mlp else 1024
     return (
         device.type == "cuda"
-        and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
+        and torch.cuda.get_device_capability(device) == (12, 0)
         and hidden == 2560
         and streams == 4
         and tokens >= min_tokens
@@ -407,7 +407,7 @@ def supports_m1_combine_mix(
 ) -> bool:
     return (
         device.type == "cuda"
-        and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
+        and torch.cuda.get_device_capability(device) == (12, 0)
         and tokens == 1
         and following_tokens == 1
         and following_lowrank == 320
@@ -693,7 +693,7 @@ def supports_tiled_combine_down(
 ) -> bool:
     return (
         device.type == "cuda"
-        and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
+        and torch.cuda.get_device_capability(device) == (12, 0)
         and tokens > 4096
         and following_tokens == tokens
         and following_lowrank == 320

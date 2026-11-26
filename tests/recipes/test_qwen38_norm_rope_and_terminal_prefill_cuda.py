@@ -382,7 +382,9 @@ def _tp2_terminal_prefill_worker(
             with pytest.raises(ValueError, match="cache-only final layer"):
                 nonterm_dec.capture_context(capture_meta, bad_cfg, compact_prefill=True)
         nonterm_dec.capture_context(capture_meta, draft_cfg, compact_prefill=True)
+        assert nonterm_dec.final_row_reduce is None
         nonterm_dec.functional(session=session)
+        assert (nonterm_dec.final_row_reduce is not None) is (nonterm_dec.row_shard_dma and maintain_draft_state)
         nonterm_dec.release_outputs()
 
         term_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=maintain_draft_state)
@@ -401,9 +403,36 @@ def _tp2_terminal_prefill_worker(
         assert term_dec._single_row_final_mixer is True
         assert term_dec.final_mixer.tokens == 1
         assert term_dec._single_row_residual is (term_dec.row_shard_dma and maintain_draft_state)
+        assert term_dec.final_row_reduce is None
         term_dec.functional(session=session)
+        assert (term_dec.final_row_reduce is not None) is term_dec.row_shard_dma
         term_dec.release_outputs()
         term_fwd = PreparedDecoderForward(term_dec)
+
+        # Classic MTP PreparedPrefillAbsorption attaches residual_output after __init__ and
+        # before functional(); verify row_shard_dma declares full residual gathers without an
+        # orphaned final_row_reduce plan.
+        if term_dec.row_shard_dma and maintain_draft_state:
+            absorb_state = PreparedDecoderState(
+                split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True,
+            )
+            absorb_dec = PreparedDecoder(
+                weights, split_scratch, absorb_state, split_cache, rotary, table, arena,
+                split_comp, frame, sequence, session=session, name=f"absorb_{tokens}",
+                max_cache_pages=num_pages, sample=True, **dec_collectives,
+            )
+            absorb_dec.residual_output = torch.zeros_like(split_scratch.residual)
+            absorb_dec.functional(session=session)
+            assert absorb_dec.final_row_reduce is None
+            assert absorb_dec.final_res_gather_a is not None
+            assert absorb_dec.final_res_gather_b is not None
+            assert absorb_dec._single_row_residual is False
+            recorded = getattr(session, "_recorded_requests", {})
+            assert all(
+                getattr(req, "name", "") != f"absorb_{tokens}.final_row_reduce"
+                for req in recorded.values()
+            )
+            absorb_dec.release_outputs()
 
         session.tune(show_progress=False)
         arena.release_preparation()

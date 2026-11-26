@@ -217,7 +217,7 @@ class PreparedAttention:
                  projection_workspace: ScratchArena | torch.Tensor | None = None,
                  max_cache_pages: int | None = None, cache_only: bool = False,
                  shard=None, qsa_gather_runtime=None, qsa_shard_mode: str | None = None,
-                 coordinator=None, input_encoded=None) -> None:
+                 coordinator=None) -> None:
         self.q_heads, self.kv_heads = scratch.query.shape[1], scratch.key.shape[1]
         self.cache_only = cache_only
         self.module, self.scratch, self.state = module, scratch, state
@@ -286,7 +286,7 @@ class PreparedAttention:
 
         for key, output in (("qkv_proj", scratch.projected_qkv),
                             ("indexer.index_qk_proj", scratch.projected_index)):
-            self.projections[key] = projection(source, weights[key], output, key, encoded=input_encoded)
+            self.projections[key] = projection(source, weights[key], output, key)
         if not cache_only:
             self.projections["o_proj"] = projection(scratch.gated, weights["o_proj"], scratch.output, "o_proj")
         self.index_query = scratch.projected_index[:, :512].view(self.tokens, 4, 128)
@@ -446,13 +446,12 @@ class PreparedAttention:
         )
         return query, gate, key, value
 
-    def pre_gather_runtime(self, source: torch.Tensor, metadata, *, input_encoded_bases=None) -> RowGatherStage:
+    def pre_gather_runtime(self, source: torch.Tensor, metadata) -> RowGatherStage:
         """Run local QKV/index projections, KV/compressed cache updates, and row-split selection."""
         if self.cache_only or self.sharded is None or self.sharded.mode != "row":
             raise ValueError("pre_gather_runtime requires non-cache-only row-split QSA")
-        proj_kwargs = {} if input_encoded_bases is None else {"encoded_bases": input_encoded_bases}
-        projected_index = self.projections["indexer.index_qk_proj"](source, **proj_kwargs)
-        projected_qkv = self.projections["qkv_proj"](source, **proj_kwargs)
+        projected_index = self.projections["indexer.index_qk_proj"](source)
+        projected_qkv = self.projections["qkv_proj"](source)
         query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
             v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
@@ -494,12 +493,9 @@ class PreparedAttention:
         gathered = self.gather_row_runtime(stage, gather_dependencies=gather_dependencies)
         return self.attend_project_runtime(stage, gathered)
 
-    def __call__(self, source: torch.Tensor, metadata, *, input_encoded_bases=None) -> torch.Tensor | None:
+    def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
         if not self.cache_only and self.sharded is not None and self.sharded.mode == "row":
-            return self.post_gather_runtime(
-                self.pre_gather_runtime(source, metadata, input_encoded_bases=input_encoded_bases)
-            )
-        proj_kwargs = {} if input_encoded_bases is None else {"encoded_bases": input_encoded_bases}
+            return self.post_gather_runtime(self.pre_gather_runtime(source, metadata))
         pending_sharded = None
         if self.sharded is not None and self.sharded.overlap:
             if self.parallel_projections is not None:
@@ -508,15 +504,15 @@ class PreparedAttention:
                     parallel_projections=self.parallel_projections,
                 )
             else:
-                projected_index = self.projections["indexer.index_qk_proj"](source, **proj_kwargs)
+                projected_index = self.projections["indexer.index_qk_proj"](source)
                 _, pending_sharded = self.sharded.start_group_selection(
                     source, projected_index, metadata, self.constants, self.workspace_bytes,
                 )
-                projected_qkv = self.projections["qkv_proj"](source, **proj_kwargs)
+                projected_qkv = self.projections["qkv_proj"](source)
             projection_workspaces = None
         elif self.concurrent is None:
-            projected_index = self.projections["indexer.index_qk_proj"](source, **proj_kwargs)
-            projected_qkv = self.projections["qkv_proj"](source, **proj_kwargs)
+            projected_index = self.projections["indexer.index_qk_proj"](source)
+            projected_qkv = self.projections["qkv_proj"](source)
             projection_workspaces = None
         else:
             (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)

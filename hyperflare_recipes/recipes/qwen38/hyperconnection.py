@@ -250,6 +250,7 @@ class PreparedHyperconnection:
                 self._triton_m1_combine_mix_mlp = spec
             else:
                 self._triton_m1_combine_mix = spec
+            return
         if supports_tiled_combine_down(
             self.tokens,
             following.tokens,

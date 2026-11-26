@@ -324,17 +324,6 @@ def _fake_aux_copy_prefix(src: torch.Tensor, dst: torch.Tensor, stream: int) -> 
     pass
 
 
-def _mxfp8_scale_mma(scale_rows_2d: torch.Tensor, hidden: int) -> torch.Tensor:
-    """Swizzle contiguous [rows, hidden // 32] UE8M0 scale rows into b12x MMA tile layout."""
-    m_tiles, k_tiles = scale_rows_2d.shape[0] // 128, hidden // 128
-    return (
-        scale_rows_2d.view(m_tiles, 4, 32, k_tiles, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .view(1, m_tiles, k_tiles, 32, 4, 4)
-    )
-
-
 def _split_prefill_metadata(gdn, qsa, half: int):
     """Derive half-chunk GDN and QSA metadata for [0, half) and [half, 2 * half) on device."""
     from hyperflare_recipes.components.recurrent import DeltaMetadata
@@ -491,12 +480,6 @@ class PreparedDecoder:
         self.shard_tokens = 0
         self.shard_rows_a = self.shard_rows_b = None
         self.shard_offset_a = self.shard_offset_b = None
-        self.attn_quantizer_plan = None
-        self.attn_local_shapes = None
-        self.attn_vals_bf16_cols = 0
-        self.attn_scale_bf16_cols = 0
-        self.attn_pad_bf16_cols = 0
-        self.layer_attn_mxfp8 = ()
         self.final_res_gather_a = self.final_res_gather_b = None
         self.final_hidden_gather_a = self.final_hidden_gather_b = None
         self.final_row_reduce = None
@@ -511,9 +494,14 @@ class PreparedDecoder:
                 row_shard_surfaces,
             )
 
-            if row_shard_surfaces(runtime) and half % shard.world_size == 0:
+            dev = scratch.hidden.device
+            if (
+                dev.type == "cuda"
+                and torch.cuda.get_device_capability(dev) == (12, 0)
+                and row_shard_surfaces(runtime)
+                and half % shard.world_size == 0
+            ):
                 st = half // shard.world_size
-                dev = scratch.hidden.device
                 # Pack BF16 hidden (2560) + RouteRecord for top_k=10 (40 BF16 cols) + 24-col padded
                 # shared gate = 2624 BF16 cols (32-element / 64-byte aligned so Inductor keeps rows
                 # strictly contiguous without stride padding).
@@ -573,54 +561,6 @@ class PreparedDecoder:
             layer_gdn_meta = state.gdn
             layer_qsa_meta = state.qsa
         source = layer_scratch.hyperconnection.block_input
-        attn_full_encoded = None
-        attn_local_packed = attn_full_packed = None
-        mxfp8_gather_eligible = False
-        if self.row_shard_dma:
-            from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
-            from b12x.preparation import PreparedCall
-            from b12x.quantization import mxfp8
-            from hyperflare_recipes.components import sm103
-            from ignition.components.collectives import PreparedGatherShards
-            from ignition.preparation.tuning import declare
-
-            st = self.shard_tokens
-            dev = source.device
-            if dev.type == "cuda" and st % 128 == 0 and half % 128 == 0 and half > 28 and not sm103.is_sm103(dev):
-                local_shapes = mxfp8.dense_rows_storage_shapes(st, 2560)
-                full_shapes = mxfp8.dense_rows_storage_shapes(half, 2560)
-                local_vals = torch.zeros(local_shapes[0], dtype=torch.float8_e4m3fn, device=dev)
-                local_srows = torch.full(local_shapes[1], 127, dtype=torch.uint8, device=dev)
-                local_smma = torch.full(local_shapes[2], 127, dtype=torch.uint8, device=dev)
-                full_vals = torch.zeros(full_shapes[0], dtype=torch.float8_e4m3fn, device=dev)
-                full_srows = torch.full(full_shapes[1], 127, dtype=torch.uint8, device=dev)
-                full_smma = torch.full(full_shapes[2], 127, dtype=torch.uint8, device=dev)
-                vals_bf16_cols = 2560 // 2
-                scale_bf16_cols = local_srows.view(st, -1).view(torch.bfloat16).shape[1]
-                # Pad packed row width to a multiple of 32 BF16 elements (64 bytes) so Inductor
-                # keeps torch.cat outputs strictly contiguous for DMA GatherShards.
-                pad_bf16_cols = (32 - (vals_bf16_cols + scale_bf16_cols) % 32) % 32
-                packed_bf16_cols = vals_bf16_cols + scale_bf16_cols + pad_bf16_cols
-                cand_local_packed = torch.zeros((st, packed_bf16_cols), dtype=torch.bfloat16, device=dev)
-                cand_full_packed = torch.zeros((half, packed_bf16_cols), dtype=torch.bfloat16, device=dev)
-                if PreparedGatherShards.fits(runtime, cand_local_packed, cand_full_packed):
-                    mxfp8_gather_eligible = True
-                    attn_local_packed, attn_full_packed = cand_local_packed, cand_full_packed
-                    attn_local_encoded = mxfp8.dense_rows_from_bases(local_vals, local_srows, local_smma)
-                    attn_full_encoded = mxfp8.dense_rows_from_bases(full_vals, full_srows, full_smma)
-                    self.attn_local_shapes = local_shapes
-                    self.attn_vals_bf16_cols = vals_bf16_cols
-                    self.attn_scale_bf16_cols = scale_bf16_cols
-                    self.attn_pad_bf16_cols = pad_bf16_cols
-                    src_shard = shard_scratch.hyperconnection.block_input
-                    self.attn_quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
-                        src_shard, attn_local_encoded.values, attn_local_encoded.scale_rows,
-                        attn_local_encoded.scale_mma, min_amax=0.0))
-                    declare(session, (self.attn_quantizer_plan.request(
-                        name=f"{name}.row_shard.attn_quant",
-                        prepare_call=lambda state, src=src_shard, enc=attn_local_encoded: PreparedCall(
-                            run=lambda: state.run(src, enc.values, enc.scale_rows, enc.scale_mma),
-                            owners=(src, enc))),))
         self.embedding = PreparedEmbedding(language.embed_tokens.weight, state.ple.token_ids,
             scratch.embedding, num_rows=state.gdn.num_tokens, session=session, name=f"{name}.embedding")
         last_index = len(language.layers) - 1
@@ -637,23 +577,11 @@ class PreparedDecoder:
             and last_index % 4 == 3
         )
         self.layers, self.reductions, self.pipelined_reductions = [], [], []
-        layer_attn_mxfp8 = []
         for index, (module, layer_weights) in enumerate(zip(language.layers, weights.layers, strict=True)):
             prefix = f"{name}.layer{index}"
             is_cache_only = self.last_layer_cache_only and index == last_index
             layer_sharded = self.row_shard_dma and index >= 1
             hc_scratch = shard_scratch if layer_sharded else layer_scratch
-            use_attn_mxfp8 = (
-                layer_sharded
-                and mxfp8_gather_eligible
-                and all(
-                    isinstance(w, MXFP8LinearWeight) and w.padded_in_features == 2560
-                    for key, w in layer_weights.attention.items()
-                    if key not in ("out_proj", "o_proj")
-                )
-            )
-            layer_attn_mxfp8.append(use_attn_mxfp8)
-            layer_input_encoded = attn_full_encoded if use_attn_mxfp8 else None
             attn_hc = PreparedHyperconnection(module.attn_hyper_connection, hc_scratch.hyperconnection,
                 priming_state=hc_scratch.residual, session=session, name=f"{prefix}.attn_hc",
                 runtime=runtime, coordinator=coordinator)
@@ -662,19 +590,18 @@ class PreparedDecoder:
                     layer_scratch.qsa, qsa_states[index], layer_qsa_meta, rotary, session=session, name=f"{prefix}.qsa",
                     workspace=workspaces, projection_workspace=workspaces,
                     max_cache_pages=max_cache_pages, draft_tokens=state.pool.layout.speculative_tokens,
-                    cache_only=True, shard=shard, coordinator=coordinator,
-                    input_encoded=layer_input_encoded)
+                    cache_only=True, shard=shard, coordinator=coordinator)
                 self.layers.append((attn_hc, attention, None, None))
                 if layer_sharded:
                     from ignition.components.collectives import ConcurrentGatherShards, PreparedGatherShards
 
-                    ag_in = attn_local_packed if use_attn_mxfp8 else shard_scratch.hyperconnection.block_input
-                    ag_out = attn_full_packed if use_attn_mxfp8 else source
+                    ag_in = shard_scratch.hyperconnection.block_input
+                    ag_out = source
                     ag_0 = PreparedGatherShards(ag_in, ag_out, runtime=runtime, session=session,
                         coordinator=coordinator, name=f"{prefix}.attn_gather.0")
                     ag_1 = PreparedGatherShards(ag_in, ag_out, runtime=runtime, session=session,
                         coordinator=coordinator, name=f"{prefix}.attn_gather.1")
-                    attn_hc_plans = _hc_plans(attn_hc) + ((self.attn_quantizer_plan,) if use_attn_mxfp8 else ())
+                    attn_hc_plans = _hc_plans(attn_hc)
                     attn_plans = _attention_plans(attention, is_qsa=True)
                     self.pipelined_reductions.append((
                         ConcurrentGatherShards(ag_0, workspace=workspaces, session=session, parallel_plans=attn_hc_plans),
@@ -697,16 +624,14 @@ class PreparedDecoder:
                     workspace=workspaces, projection_workspace=workspaces,
                     max_cache_pages=max_cache_pages, draft_tokens=state.pool.layout.speculative_tokens,
                     shard=shard, qsa_gather_runtime=qsa_gather_runtime,
-                    qsa_shard_mode=qsa_shard_mode, coordinator=coordinator,
-                    input_encoded=layer_input_encoded)
+                    qsa_shard_mode=qsa_shard_mode, coordinator=coordinator)
             else:
                 attention = PreparedGDN(module.linear_attn, layer_weights.attention, source,
                     layer_scratch.gdn, state.pool.gdn[index], layer_gdn_meta, mode=state.mode,
                     session=session, name=f"{prefix}.gdn", checkpoint_export=False,
                     workspace=workspaces, projection_workspace=workspaces,
                     records=None if gdn_records is None else gdn_records[index], in_place=gdn_in_place,
-                    partitions=getattr(state, "gdn_partitions", None),
-                    input_encoded=layer_input_encoded)
+                    partitions=getattr(state, "gdn_partitions", None))
             moe = PreparedQwenMoe(source, layer_weights.moe, session=session, name=f"{prefix}.moe",
                 scratch=layer_scratch.moe, workspace=workspaces,
                 projection_workspace=workspaces, prefill=state.mode == "prefill",
@@ -720,8 +645,8 @@ class PreparedDecoder:
                     PreparedReduceScatter,
                 )
 
-                ag_in = attn_local_packed if use_attn_mxfp8 else shard_scratch.hyperconnection.block_input
-                ag_out = attn_full_packed if use_attn_mxfp8 else source
+                ag_in = shard_scratch.hyperconnection.block_input
+                ag_out = source
                 attn_gather_0 = PreparedGatherShards(ag_in, ag_out, runtime=runtime, session=session,
                     coordinator=coordinator, name=f"{prefix}.attn_gather.0")
                 attn_gather_1 = PreparedGatherShards(ag_in, ag_out, runtime=runtime, session=session,
@@ -747,7 +672,7 @@ class PreparedDecoder:
                     runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.moe_rs.0")
                 mlp_rs_1 = PreparedReduceScatter(moe.output, shard_scratch.hidden,
                     runtime=runtime, session=session, coordinator=coordinator, name=f"{prefix}.moe_rs.1")
-                attn_hc_plans = _hc_plans(attn_hc) + ((self.attn_quantizer_plan,) if use_attn_mxfp8 else ())
+                attn_hc_plans = _hc_plans(attn_hc)
                 attn_plans = _attention_plans(attention, is_qsa=index % 4 == 3)
                 shard_prep_plans = _hc_plans(mlp_hc) + _moe_shard_plans(moe)
                 moe_compute_plans = _moe_compute_plans(moe)
@@ -802,7 +727,6 @@ class PreparedDecoder:
                     for label, value in (("attention", attention.scratch.output), ("moe", moe.output))))
             if progress is not None:
                 progress(f"prepared {name} layer {index + 1}/48")
-        self.layer_attn_mxfp8 = tuple(layer_attn_mxfp8)
         module = language.layers[1].ple
         self.ple = PreparedPLE(module,
             {key: getattr(module, key).weight for key in ("key_proj", "value_proj")},
@@ -832,7 +756,7 @@ class PreparedDecoder:
             if self.sample else None
         )
         if self.row_shard_dma:
-            from ignition.components.collectives import PreparedAllReduce, PreparedChunkedGatherShards, PreparedGatherShards
+            from ignition.components.collectives import PreparedChunkedGatherShards, PreparedGatherShards
 
             if self.sample and not self._single_row_final_mixer:
                 self.final_hidden_gather_a = PreparedGatherShards(
@@ -848,15 +772,6 @@ class PreparedDecoder:
                 self.final_res_gather_b = PreparedChunkedGatherShards(
                     shard_scratch.residual, layer_scratch.residual, runtime=runtime, session=session,
                     coordinator=coordinator, name=f"{name}.final_res_gather.b")
-            elif self._single_row_final_mixer or self._single_row_residual:
-                dev = scratch.residual.device
-                row_in = torch.zeros((1, 10240), dtype=torch.bfloat16, device=dev)
-                row_out = torch.empty_like(row_in)
-                row_rt = barrier_runtime if barrier_runtime is not None else runtime
-                self.final_row_reduce = PreparedAllReduce(
-                    row_in, row_out, runtime=row_rt, session=session,
-                    coordinator=coordinator, name=f"{name}.final_row_reduce",
-                )
         for index, (attn_hc, _, mlp_hc, moe) in enumerate(self.layers):
             if mlp_hc is None:
                 continue
@@ -896,10 +811,7 @@ class PreparedDecoder:
                     prev_cr_ffn_1 = self.pipelined_reductions[index - 1][5]
                     prev_cr_mlp_1 = self.pipelined_reductions[index - 1][7]
                     prev_moe = self.layers[index - 1][3]
-                    attn_hc_plans = _hc_plans(attn_hc) + (
-                        (self.attn_quantizer_plan,) if self.layer_attn_mxfp8[index] else ()
-                    )
-                    for plan in attn_hc_plans:
+                    for plan in _hc_plans(attn_hc):
                         workspaces.register_parallel(prev_cr_ffn_1.gather.plan, plan)
                     for plan in _moe_compute_plans(prev_moe):
                         workspaces.register_parallel(cr_ag_0.gather.plan, plan)
@@ -1082,6 +994,20 @@ class PreparedDecoder:
                     runtime=self._runtime, session=session, coordinator=self._coordinator,
                     name=f"{self._name}.final_res_gather.b")
                 self.final_row_reduce = None
+            elif (
+                self.final_res_gather_a is None
+                and (self._single_row_final_mixer or self._single_row_residual)
+            ):
+                from ignition.components.collectives import PreparedAllReduce
+
+                dev = self.scratch.residual.device
+                row_in = torch.zeros((1, 10240), dtype=torch.bfloat16, device=dev)
+                row_out = torch.empty_like(row_in)
+                row_rt = self._barrier_runtime if self._barrier_runtime is not None else self._runtime
+                self.final_row_reduce = PreparedAllReduce(
+                    row_in, row_out, runtime=row_rt, session=session,
+                    coordinator=self._coordinator, name=f"{self._name}.final_row_reduce",
+                )
             for gather in (self.final_hidden_gather_a, self.final_hidden_gather_b,
                            self.final_res_gather_a, self.final_res_gather_b, self.final_row_reduce):
                 if gather is not None:
@@ -1120,35 +1046,6 @@ class PreparedDecoder:
         self.scratch = self.residual_output = None
         self.auxiliary = None
         self._runtime = self._barrier_runtime = self._coordinator = None
-
-    def _prepare_attn_shard(self, layer_index: int, mixed: torch.Tensor) -> torch.Tensor:
-        if not self.layer_attn_mxfp8[layer_index]:
-            return mixed
-        from b12x.quantization import mxfp8
-
-        local_vals = torch.empty(self.attn_local_shapes[0], dtype=torch.float8_e4m3fn, device=mixed.device)
-        local_srows = torch.empty(self.attn_local_shapes[1], dtype=torch.uint8, device=mixed.device)
-        local_smma = torch.empty(self.attn_local_shapes[2], dtype=torch.uint8, device=mixed.device)
-        mxfp8.quantize_dense_rows(mixed, local_vals, local_srows, local_smma, plan=self.attn_quantizer_plan)
-        srows_bf16 = local_srows.view(mixed.shape[0], -1).view(torch.bfloat16)
-        if self.attn_pad_bf16_cols:
-            return torch.cat(
-                (local_vals.view(torch.bfloat16), srows_bf16, srows_bf16[:, :self.attn_pad_bf16_cols]),
-                dim=1,
-            )
-        return torch.cat((local_vals.view(torch.bfloat16), srows_bf16), dim=1)
-
-    def _unpack_attn_gathered(self, layer_index: int, packed_full: torch.Tensor):
-        if not self.layer_attn_mxfp8[layer_index]:
-            return packed_full, None
-        full_rows = packed_full.shape[0]
-        full_vals = packed_full[:, :self.attn_vals_bf16_cols].contiguous().view(torch.float8_e4m3fn)
-        hidden = full_vals.shape[1]
-        srows_end = self.attn_vals_bf16_cols + self.attn_scale_bf16_cols
-        full_srows_2d = packed_full[:, self.attn_vals_bf16_cols:srows_end].contiguous().view(torch.uint8)
-        full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
-        full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
-        return full_vals, (full_vals, full_srows, full_smma)
 
     @staticmethod
     def _prepare_ffn_shard(moe, mixed_shard: torch.Tensor) -> torch.Tensor:
@@ -1218,11 +1115,9 @@ class PreparedDecoder:
         attn_hc1 = self.layers[1][0]
         cr_ag_0_1 = self.pipelined_reductions[1][0]
         mixed_a_sh, attn_inj_a = attn_hc1.mix_runtime(res_a, None)
-        attn_a_send = self._prepare_attn_shard(1, mixed_a_sh)
-        p_ag_a = cr_ag_0_1.start(attn_a_send)
+        p_ag_a = cr_ag_0_1.start(mixed_a_sh)
         mixed_b_sh, attn_inj_b = attn_hc1.mix_runtime(res_b, None)
-        attn_b_send = self._prepare_attn_shard(1, mixed_b_sh)
-        attn_a_full = cr_ag_0_1.finish(p_ag_a, attn_b_send)
+        attn_a_full = cr_ag_0_1.finish(p_ag_a, mixed_b_sh)
         pending_prev_b = None
 
         for index in range(1, len(self.layers)):
@@ -1231,10 +1126,9 @@ class PreparedDecoder:
              cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1, cr_att_1b) = self.pipelined_reductions[index]
             is_qsa = index % 4 == 3
             has_row_gather = is_qsa and attention.sharded is not None and attention.sharded.mode == "row"
-            src_a_att, enc_a_att = self._unpack_attn_gathered(index, attn_a_full)
 
             if mlp_hc is None:
-                attention(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
+                attention(attn_a_full, qsa_a)
                 if pending_prev_b is not None:
                     prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, attention.state.compressed_k_cache)
@@ -1242,20 +1136,18 @@ class PreparedDecoder:
                     if (index - 1) in self.context_layers:
                         self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
                     mixed_b_sh, _ = attn_hc.mix_runtime(res_b, norm_b)
-                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
-                    ag_b_deps = (prev_mlp_b, attn_b_send)
+                    ag_b_deps = (prev_mlp_b, mixed_b_sh)
                 else:
-                    ag_b_deps = (attn_a_full, attn_b_send)
-                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
-                attn_b_full = cr_ag_1.finish(p_ag_b, attn_b_send)
-                src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
-                attention(src_b_att, qsa_b, input_encoded_bases=enc_b_att)
+                    ag_b_deps = (attn_a_full, mixed_b_sh)
+                p_ag_b = cr_ag_1.start(mixed_b_sh, dependencies=ag_b_deps)
+                attn_b_full = cr_ag_1.finish(p_ag_b, mixed_b_sh)
+                attention(attn_b_full, qsa_b)
                 self._finish_sharded_context_capture(capture, sharded_ctx_slots)
                 return residual, None
 
             if not is_qsa:
                 # Step 1: overlap half-A input projections with previous layer's half-B MoE RS.
-                proj_a = attention.project_input_runtime(src_a_att, input_encoded_bases=enc_a_att)
+                proj_a = attention.project_input_runtime(attn_a_full)
                 if pending_prev_b is not None:
                     prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, proj_a[0])
@@ -1263,21 +1155,19 @@ class PreparedDecoder:
                     if (index - 1) in self.context_layers:
                         self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
                     mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
-                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
-                    ag_b_deps = (prev_mlp_b, attn_b_send)
+                    ag_b_deps = (prev_mlp_b, mixed_b_sh)
                     pending_prev_b = None
                 else:
-                    ag_b_deps = (attn_a_full, attn_b_send)
+                    ag_b_deps = (attn_a_full, mixed_b_sh)
                 # Step 2: overlap half-B attention gather with half-A GDN sequence & out_proj.
-                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
+                p_ag_b = cr_ag_1.start(mixed_b_sh, dependencies=ag_b_deps)
                 out_a = attention.finish_sequence_runtime(
                     *proj_a[:4], qkvz=proj_a[4], ba=proj_a[5], metadata=gdn_a,
                 )
                 attn_b_full = cr_ag_1.finish(p_ag_b, out_a)
                 # Step 3: overlap half-A attention RS with half-B input projections.
                 p_att_a = cr_att_0.start(out_a, dependencies=(attn_b_full,))
-                src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
-                proj_b = attention.project_input_runtime(src_b_att, input_encoded_bases=enc_b_att)
+                proj_b = attention.project_input_runtime(attn_b_full)
                 att_a = cr_att_0.finish(p_att_a, proj_b[0])
                 # Step 4: prepare half-A FFN shard, then overlap half-A FFN gather with half-B GDN sequence.
                 res_a, norm_a = attn_hc.combine_norm_runtime(res_a, att_a, attn_inj_a)
@@ -1296,7 +1186,7 @@ class PreparedDecoder:
             elif has_row_gather:
                 # Step 1: overlap half-A QKV/selection with previous layer's half-B MoE RS, then gather
                 # QSA group IDs with zero DMA in flight to avoid PCIe contention.
-                stage_a = attention.pre_gather_runtime(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
+                stage_a = attention.pre_gather_runtime(attn_a_full, qsa_a)
                 if pending_prev_b is not None:
                     prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, stage_a.send)
@@ -1305,20 +1195,18 @@ class PreparedDecoder:
                     if (index - 1) in self.context_layers:
                         self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
                     mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
-                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
-                    ag_b_deps = (gathered_a, attn_b_send)
+                    ag_b_deps = (gathered_a, mixed_b_sh)
                     pending_prev_b = None
                 else:
                     gathered_a = attention.gather_row_runtime(stage_a, gather_dependencies=(attn_a_full,))
-                    ag_b_deps = (gathered_a, attn_b_send)
+                    ag_b_deps = (gathered_a, mixed_b_sh)
                 # Step 2: overlap half-B attention gather with half-A sparse attention & o_proj.
-                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
+                p_ag_b = cr_ag_1.start(mixed_b_sh, dependencies=ag_b_deps)
                 out_a = attention.attend_project_runtime(stage_a, gathered_a)
                 attn_b_full = cr_ag_1.finish(p_ag_b, out_a)
                 # Step 3: overlap half-A attention RS with half-B QKV/selection, then gather group IDs.
                 p_att_a = cr_att_0.start(out_a, dependencies=(attn_b_full,))
-                src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
-                stage_b = attention.pre_gather_runtime(src_b_att, qsa_b, input_encoded_bases=enc_b_att)
+                stage_b = attention.pre_gather_runtime(attn_b_full, qsa_b)
                 att_a = cr_att_0.finish(p_att_a, stage_b.send)
                 gathered_b = attention.gather_row_runtime(stage_b, gather_dependencies=(att_a,))
                 # Step 4: prepare half-A FFN shard, then overlap half-A FFN gather with half-B sparse attention.
@@ -1334,7 +1222,7 @@ class PreparedDecoder:
                     out_b_chunks = None
                     ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
             else:
-                out_a = attention(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
+                out_a = attention(attn_a_full, qsa_a)
                 if pending_prev_b is not None:
                     prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
                     prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, out_a)
@@ -1342,16 +1230,14 @@ class PreparedDecoder:
                     if (index - 1) in self.context_layers:
                         self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
                     mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
-                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
-                    ag_b_deps = (prev_mlp_b, attn_b_send)
+                    ag_b_deps = (prev_mlp_b, mixed_b_sh)
                     pending_prev_b = None
                 else:
-                    ag_b_deps = (attn_a_full, attn_b_send)
-                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
-                attn_b_full = cr_ag_1.finish(p_ag_b, attn_b_send)
+                    ag_b_deps = (attn_a_full, mixed_b_sh)
+                p_ag_b = cr_ag_1.start(mixed_b_sh, dependencies=ag_b_deps)
+                attn_b_full = cr_ag_1.finish(p_ag_b, mixed_b_sh)
                 p_att_a = cr_att_0.start(out_a, dependencies=(attn_b_full,))
-                src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
-                out_b = attention(src_b_att, qsa_b, input_encoded_bases=enc_b_att)
+                out_b = attention(attn_b_full, qsa_b)
                 att_a = cr_att_0.finish(p_att_a, out_b)
                 res_a, norm_a = attn_hc.combine_norm_runtime(res_a, att_a, attn_inj_a)
                 mixed_a_sh, mlp_inj_a = mlp_hc.mix_runtime(res_a, norm_a)
@@ -1400,11 +1286,10 @@ class PreparedDecoder:
                 p_ffn_b = cr_ffn_1.start(ffn_b_send, dependencies=(mlp_a,))
                 res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
                 next_mixed_a_sh, next_attn_inj_a = next_attn_hc.mix_runtime(res_a, norm_a)
-                next_attn_a_send = self._prepare_attn_shard(index + 1, next_mixed_a_sh)
-                ffn_b_full = cr_ffn_1.finish(p_ffn_b, next_attn_a_send)
+                ffn_b_full = cr_ffn_1.finish(p_ffn_b, next_mixed_a_sh)
 
                 # Step 8: overlap next layer's half-A attention gather with current half-B MoE.
-                p_next_ag_a = next_cr_ag_0.start(next_attn_a_send, dependencies=(ffn_b_full,))
+                p_next_ag_a = next_cr_ag_0.start(next_mixed_a_sh, dependencies=(ffn_b_full,))
                 moe_b = self._run_ffn_gathered(moe, ffn_b_full)
                 attn_a_full = next_cr_ag_0.finish(p_next_ag_a, moe_b)
 

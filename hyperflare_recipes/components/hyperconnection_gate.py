@@ -143,8 +143,8 @@ def _hc_gate_bptr_4acc(
     tl.store(OUT + m[:, None] * H + h[None, :], (total * (1.0 / S)).to(tl.bfloat16), mask)
 
 
-def _is_sm12x(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
+def _is_sm120(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) == (12, 0)
 
 
 class PreparedHyperconnectionGate:
@@ -164,7 +164,7 @@ class PreparedHyperconnectionGate:
         self._options = None
 
         triton_eligible = (
-            _is_sm12x(source.device)
+            _is_sm120(source.device)
             and streams == 4
             and rank == 320
             and source.dtype == torch.bfloat16

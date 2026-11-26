@@ -582,3 +582,119 @@ def test_fused_ple_triton_kernels_compiled_parity(tokens, sequences):
                 rel = float((got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12))
                 assert rel < 1e-3, f"relL2={rel}"
             assert torch.count_nonzero(norm_got[~live[:, 0]]) == 0
+
+
+@CUDA
+@torch.no_grad()
+def test_fused_ple_triton_propagates_live_nan_and_shares_norm_gains():
+    """Fused PLE kernels propagate NaN on live tokens, keep inactive tokens masked, and reuse gain copies."""
+    from types import SimpleNamespace
+    import triton
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
+    from hyperflare_recipes.recipes.qwen38.ple import (
+        _PLE_KERNEL_CONFIG,
+        _ple_combine_output_5x512,
+        _ple_gate_norm_5x512,
+        _ple_norm_gains,
+    )
+    from ignition.preparation.triton import warmup_triton
+
+    device = torch.device("cuda", 0)
+    norm_key = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    norm_query = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    norm_conv = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    fake_module = SimpleNamespace(norm_key=norm_key, norm_query=norm_query, norm_conv=norm_conv)
+    gains_a = _ple_norm_gains(fake_module)
+    gains_b = _ple_norm_gains(fake_module)
+    assert all(a is b for a, b in zip(gains_a, gains_b, strict=True))
+    w_key, w_query, w_conv = gains_a
+
+    tokens, sequences = 4, 2
+    key_raw = torch.full((tokens, 10240), 0.1, dtype=torch.bfloat16, device=device)
+    value = torch.full((tokens, 2560), 0.2, dtype=torch.bfloat16, device=device)
+    source = torch.full((tokens, 10240), 0.1, dtype=torch.bfloat16, device=device)
+    convolved = torch.full((tokens, 10240), 0.3, dtype=torch.bfloat16, device=device)
+    # Token 0: live with NaN in key (produces NaN gate -> NaN sig_gate).
+    # Token 1: live with NaN in value (finite sig_gate, NaN gated value).
+    # Token 2: live finite baseline.
+    # Token 3: inactive with NaN in both key and value (must stay masked without NaN leakage).
+    key_raw[0, 0] = float("nan")
+    value[1, 0] = float("nan")
+    key_raw[3, 0] = float("nan")
+    value[3, 0] = float("nan")
+
+    starts = torch.tensor([0, 3, 4], dtype=torch.int32, device=device)
+    slots = torch.tensor([0, -1], dtype=torch.int64, device=device)
+    num_seqs = torch.tensor([2], dtype=torch.int32, device=device)
+    num_tokens = torch.tensor([3], dtype=torch.int32, device=device)
+
+    grid = (tokens * 4, 1, 1)
+    gate_opts = {
+        "EPS_K": 1e-6,
+        "EPS_Q": 1e-6,
+        "EPS_C": 1e-6,
+        "MAX_SEQS": sequences,
+        "SEQ_BLOCK": triton.next_power_of_2(sequences),
+        "EVICT_IO": False,
+    }
+    sig = torch.empty((tokens, 4), dtype=torch.bfloat16, device=device)
+    norm = torch.empty_like(source)
+    ple_out = torch.empty_like(source)
+    res_out = torch.empty_like(source)
+    next_norm = torch.empty_like(source)
+    dummy = torch.empty((1,), dtype=torch.bfloat16, device=device)
+    warmup_triton(
+        _ple_gate_norm_5x512.fn,
+        (key_raw, value, source, w_key, w_query, w_conv, starts, slots, num_seqs, num_tokens, sig, norm),
+        grid,
+        num_warps=_PLE_KERNEL_CONFIG.num_warps,
+        num_stages=_PLE_KERNEL_CONFIG.num_stages,
+        **gate_opts,
+    )
+    for add_res, emit_norm in ((False, False), (True, True)):
+        warmup_triton(
+            _ple_combine_output_5x512.fn,
+            (source, convolved, value, sig, w_conv, res_out, next_norm),
+            grid,
+            num_warps=_PLE_KERNEL_CONFIG.num_warps,
+            num_stages=_PLE_KERNEL_CONFIG.num_stages,
+            ADD_RESIDUAL=add_res,
+            EMIT_NORM=emit_norm,
+            NORM_EPS=1e-6 if emit_norm else 0.0,
+            EVICT_IO=False,
+        )
+
+    _ple_gate_norm_5x512[grid](
+        key_raw, value, source, w_key, w_query, w_conv, starts, slots, num_seqs, num_tokens, sig, norm, **gate_opts,
+    )
+    _ple_combine_output_5x512[grid](
+        source, convolved, value, sig, w_conv, ple_out, dummy,
+        ADD_RESIDUAL=False, EMIT_NORM=False, NORM_EPS=0.0, EVICT_IO=False,
+    )
+    _ple_combine_output_5x512[grid](
+        source, convolved, value, sig, w_conv, res_out, next_norm,
+        ADD_RESIDUAL=True, EMIT_NORM=True, NORM_EPS=1e-6, EVICT_IO=False,
+    )
+
+    assert torch.isnan(sig[0, 0])
+    assert torch.isnan(norm[0, :2560]).all()
+    assert torch.isnan(ple_out[0, :2560]).all()
+    assert torch.isnan(res_out[0, :2560]).all()
+    assert torch.isnan(next_norm[0, :2560]).all()
+
+    assert torch.isfinite(sig[1]).all()
+    assert torch.isnan(norm[1]).all()
+    assert torch.isnan(ple_out[1, 0])
+    assert torch.isnan(res_out[1, 0])
+    assert torch.isnan(next_norm[1, :2560]).all()
+
+    assert torch.isfinite(sig[2]).all()
+    assert torch.isfinite(norm[2]).all()
+    assert torch.isfinite(ple_out[2]).all()
+
+    assert torch.equal(sig[3], torch.full((4,), -1.0, dtype=torch.bfloat16, device=device))
+    assert torch.count_nonzero(norm[3]) == 0
+    assert torch.equal(ple_out[3], convolved[3])
+    assert torch.equal(res_out[3], source[3] + convolved[3])
+    assert torch.isfinite(next_norm[3]).all()
+

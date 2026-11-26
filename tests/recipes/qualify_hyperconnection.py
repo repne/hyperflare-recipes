@@ -54,7 +54,8 @@ def qualify(snapshot: Path) -> list[dict]:
             prepared.prepare_combine_norm(following, priming_state=source,
                 session=session, name=f"combine_norm_{tokens}")
             for projection in (prepared.down, prepared.gate):
-                assert projection.plan.selection.source in ("tuned", "cached")
+                if projection.plan is not None:
+                    assert projection.plan.selection.source in ("tuned", "cached")
             block = torch.zeros((tokens, 2560), dtype=torch.bfloat16, device=device)
             mixed = torch.empty_like(block)
             combined = torch.empty_like(source)

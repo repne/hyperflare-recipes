@@ -35,6 +35,19 @@ _PLE_KERNEL_CONFIG = triton.Config({}, num_warps=4, num_stages=2)
 _PLE_MAX_INLINE_SEQS = 512
 
 
+def _ple_norm_gains(module: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Retain one FP32 gain triple for every prepared use of an immutable PLE module."""
+    gains = getattr(module, "_flare_ple_norm_gains", None)
+    if gains is None:
+        gains = (
+            persistent_copy((1.0 + module.norm_key.weight.detach().float()).contiguous()),
+            persistent_copy((1.0 + module.norm_query.weight.detach().float()).contiguous()),
+            persistent_copy((1.0 + module.norm_conv.weight.detach().float()).contiguous()),
+        )
+        module._flare_ple_norm_gains = gains
+    return gains
+
+
 @triton.autotune(configs=[_PLE_KERNEL_CONFIG], key=[])
 @triton.jit
 def _ple_gate_norm_5x512(
@@ -147,8 +160,9 @@ def _ple_gate_norm_5x512(
         axis=0,
     ).to(tl.bfloat16).to(tl.float32)
     gate = (dot / 50.59644256269407).to(tl.bfloat16).to(tl.float32)
-    sign = tl.where(gate > 0.0, 1.0, tl.where(gate < 0.0, -1.0, 0.0))
-    clamped = tl.maximum(tl.abs(gate), 1e-6).to(tl.bfloat16).to(tl.float32)
+    is_nan = gate != gate
+    sign = tl.where(is_nan, gate, tl.where(gate > 0.0, 1.0, tl.where(gate < 0.0, -1.0, 0.0)))
+    clamped = tl.where(is_nan, gate, tl.maximum(tl.abs(gate), 1e-6)).to(tl.bfloat16).to(tl.float32)
     gate_s = (tl.sqrt(clamped).to(tl.bfloat16).to(tl.float32) * sign).to(tl.bfloat16).to(tl.float32)
     sig_bf16 = tl.sigmoid(gate_s).to(tl.bfloat16)
     tl.store(SIG_GATE + tok * 4 + stream, sig_bf16)
@@ -207,7 +221,7 @@ def _ple_combine_output_5x512(
     g_base = stream * 2560
 
     sig = tl.load(SIG_GATE + tok * 4 + stream).to(tl.float32)
-    if sig >= 0.0:
+    if sig != -1.0:
         g0 = (sig * tl.load(VALUE + val_base + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
         g1 = (sig * tl.load(VALUE + val_base + 512 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
         g2 = (sig * tl.load(VALUE + val_base + 1024 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
@@ -680,16 +694,18 @@ class PreparedPLE:
             sequences, dtype=torch.int32, device=self.device
         ).view(1, -1)
         self._max_seqs = sequences
-        self._fused_triton = sequences <= _PLE_MAX_INLINE_SEQS
+        self._fused_triton = (
+            self.device.type == "cuda"
+            and torch.cuda.get_device_capability(self.device) == (12, 0)
+            and sequences <= _PLE_MAX_INLINE_SEQS
+        )
         self._evict_io = self.tokens >= 2048
         self._ple_grid = (self.tokens * 4, 1, 1)
         self._w_key = self._w_query = self._w_conv = None
         self._next_norm_gain = None
         self._next_norm_eps = 0.0
         if self._fused_triton:
-            self._w_key = persistent_copy((1.0 + module.norm_key.weight.detach().float()).contiguous())
-            self._w_query = persistent_copy((1.0 + module.norm_query.weight.detach().float()).contiguous())
-            self._w_conv = persistent_copy((1.0 + module.norm_conv.weight.detach().float()).contiguous())
+            self._w_key, self._w_query, self._w_conv = _ple_norm_gains(module)
             self._gate_options = {
                 "EPS_K": float(module.norm_key.eps),
                 "EPS_Q": float(module.norm_query.eps),
