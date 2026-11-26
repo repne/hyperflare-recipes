@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import partial
+from functools import cached_property, partial
 
 import torch
 from b12x.attention import qsa
 from b12x.preparation import PreparationSession, PreparedCall
 
 from hyperflare_recipes.components import sm103
+from hyperflare_recipes.components.head_gate import qsa_output_gate
 from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope_kv_write
 from hyperflare_recipes.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from hyperflare_recipes.components.linear import ParallelProjections, QuantizedProjection, UnquantizedProjection
@@ -187,6 +188,20 @@ class QSAScratch:
         return QSAScratch(*(getattr(self, field)[:None if field in whole else tokens]
                             for field in self.__dataclass_fields__))
 
+    @cached_property
+    def mxfp8_gated(self):
+        from b12x.quantization import mxfp8
+
+        rows, columns = self.gated.shape
+        shapes = mxfp8.dense_rows_storage_shapes(rows, columns)
+        bases = tuple(
+            torch.zeros(shape, dtype=dtype, device=self.gated.device)
+            for shape, dtype in zip(shapes, (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True)
+        )
+        bases[1].fill_(127)
+        bases[2].fill_(127)
+        return mxfp8.dense_rows_from_bases(*bases)
+
 
 @dataclass(frozen=True)
 class RowGatherStage:
@@ -277,18 +292,33 @@ class PreparedAttention:
                         score_workspace_bytes=score_workspace)
         if rotary.cos.shape[0] < context:
             raise ValueError("rotary table capacity must cover the admitted context")
+        from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+
+        self.o_proj_encoding = None
+        if (
+            not cache_only
+            and self.tokens > 28
+            and projection_workspace is not None
+            and not sm103.is_sm103(source.device)
+            and isinstance(weights["o_proj"], MXFP8LinearWeight)
+            and weights["o_proj"].padded_in_features == scratch.gated.shape[1]
+        ):
+            self.o_proj_encoding = scratch.mxfp8_gated
         self.projections = {}
-        def projection(source, weight, output, key):
+        def projection(source, weight, output, key, *, encoded=None):
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(source, weight, output, session=session, name=f"{name}.{key}")
             return QuantizedProjection(source, weight, output, session=session,
-                                       name=f"{name}.{key}", activation_mode="auto", workspace=projection_workspace)
+                                       name=f"{name}.{key}", activation_mode="auto",
+                                       workspace=projection_workspace, encoded=encoded)
 
         for key, output in (("qkv_proj", scratch.projected_qkv),
                             ("indexer.index_qk_proj", scratch.projected_index)):
             self.projections[key] = projection(source, weights[key], output, key)
         if not cache_only:
-            self.projections["o_proj"] = projection(scratch.gated, weights["o_proj"], scratch.output, "o_proj")
+            self.projections["o_proj"] = projection(
+                scratch.gated, weights["o_proj"], scratch.output, "o_proj", encoded=self.o_proj_encoding
+            )
         self.index_query = scratch.projected_index[:, :512].view(self.tokens, 4, 128)
         self.index_key = scratch.projected_index[:, 512:]
         self.binding_kwargs = {
@@ -395,6 +425,13 @@ class PreparedAttention:
 
     def functional(self, *, session):
         self.functional_qsa = None if self.sharded is not None else FunctionalQSA(self)
+        self.o_proj_encoding_layout = ()
+        if self.o_proj_encoding is not None:
+            from b12x.quantization import mxfp8
+
+            self.o_proj_encoding_layout = tuple((tuple(base.shape), base.dtype) for base in (
+                self.o_proj_encoding.values, self.o_proj_encoding.scale_rows.view(torch.uint8),
+                mxfp8.dense_scale_storage(self.o_proj_encoding.scale_mma)))
         for projection in self.projections.values():
             projection.functional(session=session)
         if self.parallel_projections is not None:
@@ -414,7 +451,21 @@ class PreparedAttention:
             if name not in ("main_block_table", "compressed_block_table", "raw_state_slot_ids",
                             "output", "selected_positions")}
         self.scratch = self.metadata = self.index_query = self.index_key = None
-        self.binding = self.binding_kwargs = self.workspace = None
+        self.binding = self.binding_kwargs = self.workspace = self.o_proj_encoding = None
+
+    def _gate_and_project_runtime(self, attended: torch.Tensor, gate: torch.Tensor, request_ids: torch.Tensor) -> torch.Tensor:
+        if self.o_proj_encoding_layout:
+            mma_unpadded = self.tokens % 128 == 0
+            encoded = tuple(
+                torch.empty(shape, dtype=dtype, device=attended.device)
+                if index < 2 or mma_unpadded
+                else torch.full(shape, 127, dtype=dtype, device=attended.device)
+                for index, (shape, dtype) in enumerate(self.o_proj_encoding_layout)
+            )
+            qsa_output_gate(attended, gate, request_ids, encoded_bases=encoded)
+            return self.projections["o_proj"](encoded[0], encoded_bases=encoded)
+        gated = qsa_output_gate(attended, gate, request_ids)
+        return self.projections["o_proj"](gated)
 
     def _prepare_qkv_runtime(self, projected_qkv: torch.Tensor, metadata):
         q_width = self.q_heads * 512
@@ -470,10 +521,7 @@ class PreparedAttention:
             attended = self.sparse(self.state.main_k_cache, self.state.main_v_cache, query=stage.query,
                 selected=stage.bindings["selected_positions"], block_table=stage.metadata.main_block_table,
                 requests=stage.metadata.request_ids, positions=stage.metadata.query_positions)
-        gated = attended.flatten(1) * torch.sigmoid(stage.gate.reshape(self.tokens, self.q_heads * 256))
-        output = self.projections["o_proj"](gated)
-        output.masked_fill_((stage.metadata.request_ids < 0)[:, None], 0)
-        return output
+        return self._gate_and_project_runtime(attended, stage.gate, stage.metadata.request_ids)
 
     def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
         if not self.cache_only and self.sharded is not None and self.sharded.mode == "row":
@@ -527,7 +575,4 @@ class PreparedAttention:
             attended = self.sparse(self.state.main_k_cache, self.state.main_v_cache, query=query,
                 selected=selected, block_table=metadata.main_block_table,
                 requests=metadata.request_ids, positions=metadata.query_positions)
-        gated = attended.flatten(1) * torch.sigmoid(gate.reshape(self.tokens, self.q_heads * 256))
-        output = self.projections["o_proj"](gated)
-        output.masked_fill_((metadata.request_ids < 0)[:, None], 0)
-        return output
+        return self._gate_and_project_runtime(attended, gate, metadata.request_ids)

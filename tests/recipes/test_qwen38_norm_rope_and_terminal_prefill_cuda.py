@@ -270,6 +270,74 @@ def test_qk_head_norm_mrope_kv_write_matches_unfused(q_heads, kv_heads, tokens, 
     assert torch.equal(v_fused.view(torch.uint8), v_ref.view(torch.uint8))
 
 
+@pytest.mark.parametrize("q_heads", [24, 12, 6])
+@pytest.mark.parametrize("tokens", [1, 8, 32, 128, 512])
+def test_qsa_output_gate_matches_canonical_and_mxfp8(q_heads, tokens):
+    """Fused strided QSA output gate matches BF16 sigmoid gating and MXFP8 quantization, zeroing inactive rows."""
+    _requires_cuda()
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.quantization import mxfp8
+    from hyperflare_recipes.components.head_gate import qsa_output_gate
+
+    device = torch.device("cuda:0")
+    gen = torch.Generator(device="cpu").manual_seed(3030 + tokens * 7 + q_heads)
+    q_width = q_heads * 512
+    qkv = (torch.randn((tokens, q_width + 512), generator=gen) * 1.5).bfloat16().to(device)
+    attended = (torch.randn((tokens, q_heads, 256), generator=gen) * 1.2).bfloat16().to(device)
+    req_ids = torch.zeros((tokens,), dtype=torch.int64, device=device)
+    if tokens >= 4:
+        req_ids[-2:] = -1
+        attended[-2:] = float("nan")
+        qkv[-2:] = float("inf")
+    gate = qkv[:, :q_width].view(tokens, q_heads, 512)[..., 256:]
+
+    live = req_ids >= 0
+    ref_bf16 = torch.where(
+        live[:, None],
+        attended.flatten(1) * torch.sigmoid(gate.reshape(tokens, q_heads * 256)),
+        torch.zeros((tokens, q_heads * 256), dtype=torch.bfloat16, device=device),
+    )
+    out_bf16 = qsa_output_gate(attended, gate, req_ids)
+    assert torch.isfinite(out_bf16).all()
+    if tokens >= 4:
+        assert not out_bf16[-2:].any()
+    torch.testing.assert_close(out_bf16, ref_bf16, rtol=2e-2, atol=2e-2)
+    rel_l2 = ((out_bf16.float() - ref_bf16.float()).norm() / ref_bf16.float().norm().clamp_min(1e-6)).item()
+    assert rel_l2 < 1e-4, f"rel_l2={rel_l2:.6g}"
+
+    shapes = mxfp8.dense_rows_storage_shapes(tokens, q_heads * 256)
+    mma_unpadded = tokens % 128 == 0
+    bases = tuple(
+        torch.empty(s, dtype=dt, device=device) if i < 2 or mma_unpadded else torch.full(s, 127, dtype=dt, device=device)
+        for i, (s, dt) in enumerate(zip(shapes, (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+    )
+    qsa_output_gate(attended, gate, req_ids, encoded_bases=bases)
+    ref_bases = tuple(
+        torch.empty(s, dtype=dt, device=device) if i < 2 or mma_unpadded else torch.full(s, 127, dtype=dt, device=device)
+        for i, (s, dt) in enumerate(zip(shapes, (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+    )
+    ref_enc = mxfp8.dense_rows_from_bases(*ref_bases)
+    with PreparationSession(device=device) as session:
+        qplan = mxfp8.plan(mxfp8.query_from_call(out_bf16, ref_enc.values, ref_enc.scale_rows, ref_enc.scale_mma))
+        session.prepare((qplan.request(
+            name="ref_quant",
+            prepare_call=lambda st: PreparedCall(run=lambda: st.run(out_bf16, ref_enc.values, ref_enc.scale_rows, ref_enc.scale_mma)),
+        ),))
+    mxfp8.quantize_dense_rows(out_bf16, *ref_bases, plan=qplan)
+    assert torch.equal(bases[0].view(torch.uint8), ref_bases[0].view(torch.uint8))
+    live_rows = tokens - 2 if tokens >= 4 else tokens
+    assert torch.equal(bases[1].reshape(tokens, -1)[:live_rows], ref_bases[1].reshape(tokens, -1)[:live_rows])
+    if tokens < 4:
+        assert torch.equal(bases[2], ref_bases[2])
+    else:
+        assert not bases[0].view(torch.uint8)[-2:].any()
+        assert (bases[1].reshape(tokens, -1)[-2:] == 127).all()
+        mma_actual = mxfp8.dense_rows_from_bases(*bases).scale_mma.permute(2, 1, 0, 4, 3, 5).reshape(-1, q_heads * 8)
+        mma_ref = ref_enc.scale_mma.permute(2, 1, 0, 4, 3, 5).reshape(-1, q_heads * 8)
+        assert torch.equal(mma_actual[:live_rows], mma_ref[:live_rows])
+        assert (mma_actual[live_rows:tokens].view(torch.uint8) == 127).all()
+
+
 def _run_decoder_forward(forward):
     forward()
 
