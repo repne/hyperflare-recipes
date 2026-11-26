@@ -123,13 +123,21 @@ def _combine_norm_5x512(
     tl.store(NORMALIZED + s_base + 2048 + k, (f4 * inv_rms * tl.load(GAIN + g_base + 2048 + k).to(tl.float32)).to(tl.bfloat16))
 
 
-def supports_triton_combine_norm(tokens: int, device: torch.device, *, hidden: int = 2560, streams: int = 4) -> bool:
+def supports_triton_combine_norm(
+    tokens: int,
+    device: torch.device,
+    *,
+    hidden: int = 2560,
+    streams: int = 4,
+    fuse_mlp: bool = False,
+) -> bool:
+    min_tokens = 2 if fuse_mlp else 1024
     return (
         device.type == "cuda"
         and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
         and hidden == 2560
         and streams == 4
-        and tokens >= 1024
+        and tokens >= min_tokens
     )
 
 

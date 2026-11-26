@@ -250,7 +250,7 @@ class PreparedHyperconnection:
                 self._triton_m1_combine_mix_mlp = spec
             else:
                 self._triton_m1_combine_mix = spec
-        if supports_triton_combine_norm(self.tokens, device):
+        if supports_triton_combine_norm(self.tokens, device, fuse_mlp=fuse_mlp):
             if fuse_mlp:
                 self._triton_combine_norm_mlp = warmup_combine_norm(
                     priming_state,

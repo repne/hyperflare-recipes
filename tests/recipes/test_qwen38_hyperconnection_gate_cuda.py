@@ -167,8 +167,21 @@ def test_prepared_hyperconnection_mix_runtime_compiled_parity(rows: int, has_inj
             torch.testing.assert_close(inj_buf, expected_inj, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("rows", [1024, 2048, 4096])
-@pytest.mark.parametrize("fuse_mlp", [False, True])
+@pytest.mark.parametrize(
+    "rows,fuse_mlp",
+    [
+        (8, True),
+        (16, True),
+        (32, True),
+        (128, True),
+        (1024, False),
+        (1024, True),
+        (2048, False),
+        (2048, True),
+        (4096, False),
+        (4096, True),
+    ],
+)
 def test_triton_combine_norm_compiled_parity(rows: int, fuse_mlp: bool):
     from b12x.norm.hyperconnection import reference
     from ignition.preparation.aot import aot_forward
