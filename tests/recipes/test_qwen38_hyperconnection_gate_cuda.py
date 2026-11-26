@@ -170,9 +170,7 @@ def test_prepared_hyperconnection_mix_runtime_compiled_parity(rows: int, has_inj
 @pytest.mark.parametrize(
     "rows,fuse_mlp",
     [
-        (8, True),
-        (16, True),
-        (32, True),
+        (64, True),
         (128, True),
         (1024, False),
         (1024, True),
@@ -490,14 +488,7 @@ def test_prepared_decoder_m1_combine_mix_compiled_parity(monkeypatch):
 
                 assert torch.equal(fused_req.pending_token, ref_req.pending_token)
                 assert torch.equal(fused_comp.records, ref_comp.records)
-                # FUSE_MLP contracts routed + shared * sigmoid(gate) via fma.rn.bf16x2 (1 BF16 ULP vs
-                # separate BF16 mul + add), which propagates across 4 random synthetic layers.
-                rel_hidden = (
-                    (fused_pool.last_hidden[1].float() - ref_pool.last_hidden[1].float()).norm()
-                    / ref_pool.last_hidden[1].float().norm().clamp_min(1e-6)
-                ).item()
-                assert rel_hidden < 3e-2, f"last_hidden diverged: rel_l2={rel_hidden:.6g}"
-                torch.testing.assert_close(fused_pool.last_hidden[1], ref_pool.last_hidden[1], rtol=5e-2, atol=1e-1)
+                assert torch.equal(fused_pool.last_hidden[1], ref_pool.last_hidden[1])
 
                 # Inactive replay must preserve persistent state bit-for-bit.
                 snap_backing = fused_pool.backing.clone()
@@ -665,6 +656,163 @@ def test_sm120_hyperconnection_triton_guards_reject_sm103_and_sm121(monkeypatch)
         assert supports_triton_combine_norm(2048, device, fuse_mlp=False) is expected
         assert supports_m1_combine_mix(1, 1, 320, device, following_gate_impl="triton_m1_gemv") is expected
         assert supports_tiled_combine_down(4100, 4100, 320, down_w, device, following_fuses_scaled_silu=False) is expected
+
+
+def test_combine_norm_thresholds_tiled_return_and_exact_bf16_rounding():
+    """Verify SM120 fuse_mlp threshold (>=64), tiled no-fallthrough, and non-contracted BF16 rounding."""
+    from hyperflare_recipes.components.hyperconnection_combine import (
+        launch_combine_norm,
+        launch_m1_combine_mix,
+        launch_tiled_combine_down,
+        supports_triton_combine_norm,
+        warmup_combine_norm,
+        warmup_m1_combine_mix,
+        warmup_tiled_combine_down,
+    )
+    from hyperflare_recipes.recipes.qwen38.hyperconnection import (
+        HyperconnectionScratch,
+        PreparedHyperconnection,
+    )
+    from ignition.preparation.aot import aot_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        pytest.skip("requires SM120 Triton hyperconnection combine kernels")
+
+    for low in (2, 4, 8, 16, 32):
+        assert not supports_triton_combine_norm(low, device, fuse_mlp=True)
+    for high in (64, 128, 1024, 4096):
+        assert supports_triton_combine_norm(high, device, fuse_mlp=True)
+    assert not supports_triton_combine_norm(512, device, fuse_mlp=False)
+    assert supports_triton_combine_norm(1024, device, fuse_mlp=False)
+
+    # Low-token (M=4) fused MLP stays on tuned b12x combine_norm rather than _combine_norm_5x512.
+    first_mod = _make_hc_module(device, has_injection=True, seed=9100)
+    next_mod = _make_hc_module(device, has_injection=True, seed=9101)
+    with torch.inference_mode(), RecordedPreparationSession(
+        device=device, checkpoint="test-cn-thresh-4", workload_schema="test-cn-thresh",
+        numerical_policy="bf16", autotune_effort="off",
+    ) as session:
+        scratch = HyperconnectionScratch.allocate(4, device)
+        priming = torch.zeros_like(scratch.normalized)
+        first = PreparedHyperconnection(first_mod, scratch, priming_state=priming, session=session, name="first")
+        following = PreparedHyperconnection(next_mod, scratch, priming_state=priming, session=session, name="next")
+        first.prepare_combine_norm(following, priming_state=priming, session=session, name="cn", fuse_mlp=True)
+        assert first._triton_combine_norm_mlp is None
+        assert "combine_norm" in first.plans
+
+    # Tiled combine-down (tokens > 4096) returns without also warming up _combine_norm_5x512,
+    # and allow_combine_mix=False keeps combine_norm_runtime populated for pipelined callers.
+    with torch.inference_mode(), RecordedPreparationSession(
+        device=device, checkpoint="test-cn-tiled-ret", workload_schema="test-cn-tiled-ret",
+        numerical_policy="bf16", autotune_effort="off",
+    ) as session:
+        scratch = HyperconnectionScratch.allocate(4100, device)
+        priming = torch.zeros_like(scratch.normalized)
+        first = PreparedHyperconnection(first_mod, scratch, priming_state=priming, session=session, name="first")
+        following = PreparedHyperconnection(next_mod, scratch, priming_state=priming, session=session, name="next")
+        first.prepare_combine_norm(
+            following, priming_state=priming, session=session, name="cn", fuse_mlp=True, allow_combine_mix=True,
+        )
+        assert first._triton_tiled_combine_down_mlp is not None
+        assert first._triton_combine_norm_mlp is None
+        assert first._triton_combine_norm is None
+        assert "combine_norm" not in first.plans
+
+        first_pipe = PreparedHyperconnection(first_mod, scratch, priming_state=priming, session=session, name="first_p")
+        first_pipe.prepare_combine_norm(
+            following, priming_state=priming, session=session, name="cn_p", fuse_mlp=False, allow_combine_mix=False,
+        )
+        assert not first_pipe.has_combine_mix
+        assert first_pipe._triton_combine_norm is not None
+
+    # FUSE_MLP=True matches FUSE_MLP=False on routed + shared * sigmoid(gate) bit-for-bit
+    # across _combine_norm_5x512, _combine_norm_down_m1_split4, and _combine_norm_down_tiled_split4.
+    gen = torch.Generator(device=device).manual_seed(9200)
+    gain = 1.0 + torch.randn((10240,), generator=gen, dtype=torch.float32, device=device) * 0.05
+    down_w = (torch.randn((336, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.02).contiguous()
+    up_w = (torch.randn((10240, 320), generator=gen, dtype=torch.bfloat16, device=device) * 0.02).contiguous()
+
+    m = 64
+    st = torch.randn((m, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    routed = torch.randn((m, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    shared = torch.randn((m, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    sgate = torch.randn((m, 1), generator=gen, dtype=torch.bfloat16, device=device) * 0.5
+    inj = torch.randn((m, 4), generator=gen, dtype=torch.bfloat16, device=device) * 0.5
+    blk = routed + shared * torch.sigmoid(sgate)
+    c_tmp, n_tmp = torch.empty_like(st), torch.empty_like(st)
+    g_plain, o_plain = warmup_combine_norm(st, blk, inj, gain, c_tmp, n_tmp, eps=1e-6, fuse_mlp=False)
+    g_fused, o_fused = warmup_combine_norm(st, routed, inj, gain, c_tmp, n_tmp, eps=1e-6, fuse_mlp=True)
+    out_p, out_f = [torch.empty_like(st), torch.empty_like(st)], [torch.empty_like(st), torch.empty_like(st)]
+
+    def run_cn():
+        cp, np_ = launch_combine_norm(st, blk, inj, gain, grid=g_plain, options=o_plain)
+        cf, nf = launch_combine_norm(
+            st, routed, inj, gain, grid=g_fused, options=o_fused,
+            shared_projected=shared, shared_gate=sgate,
+        )
+        out_p[0].copy_(cp)
+        out_p[1].copy_(np_)
+        out_f[0].copy_(cf)
+        out_f[1].copy_(nf)
+
+    aot_forward(run_cn)(run_cn)
+    assert torch.equal(out_f[0], out_p[0])
+    assert torch.equal(out_f[1], out_p[1])
+
+    st1 = torch.randn((1, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    r1 = torch.randn((1, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    s1 = torch.randn((1, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    sg1 = torch.randn((1, 1), generator=gen, dtype=torch.bfloat16, device=device) * 0.5
+    inj1 = torch.randn((1, 4), generator=gen, dtype=torch.bfloat16, device=device) * 0.5
+    b1 = r1 + s1 * torch.sigmoid(sg1)
+    c1, n1 = torch.empty_like(st1), torch.empty_like(st1)
+    m1 = torch.empty((1, 2560), dtype=torch.bfloat16, device=device)
+    sp_p = warmup_m1_combine_mix(st1, b1, inj1, gain, down_w, up_w, c1, n1, m1, eps=1e-6, has_next_injection=True, fuse_mlp=False)
+    sp_f = warmup_m1_combine_mix(st1, r1, inj1, gain, down_w, up_w, c1, n1, m1, eps=1e-6, has_next_injection=True, fuse_mlp=True)
+    res_p = [torch.empty_like(st1), torch.empty_like(m1), torch.empty_like(inj1)]
+    res_f = [torch.empty_like(st1), torch.empty_like(m1), torch.empty_like(inj1)]
+
+    def run_m1():
+        cp, mp, ip = launch_m1_combine_mix(st1, b1, inj1, gain, down_w, up_w, spec=sp_p)
+        cf, mf, if_ = launch_m1_combine_mix(
+            st1, r1, inj1, gain, down_w, up_w, spec=sp_f, shared_projected=s1, shared_gate=sg1,
+        )
+        for d, s in zip(res_p, (cp, mp, ip), strict=True):
+            d.copy_(s)
+        for d, s in zip(res_f, (cf, mf, if_), strict=True):
+            d.copy_(s)
+
+    aot_forward(run_m1)(run_m1)
+    for a, b in zip(res_f, res_p, strict=True):
+        assert torch.equal(a, b)
+
+    m_t = 4100
+    st_t = torch.randn((m_t, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    r_t = torch.randn((m_t, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    s_t = torch.randn((m_t, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.25
+    sg_t = torch.randn((m_t, 1), generator=gen, dtype=torch.bfloat16, device=device) * 0.5
+    inj_t = torch.randn((m_t, 4), generator=gen, dtype=torch.bfloat16, device=device) * 0.5
+    b_t = r_t + s_t * torch.sigmoid(sg_t)
+    c_t, n_t = torch.empty_like(st_t), torch.empty_like(st_t)
+    bn_t = torch.empty((m_t, 320), dtype=torch.bfloat16, device=device)
+    tp_p = warmup_tiled_combine_down(st_t, b_t, inj_t, gain, down_w, c_t, n_t, bn_t, eps=1e-6, has_next_injection=True, fuse_mlp=False)
+    tp_f = warmup_tiled_combine_down(st_t, r_t, inj_t, gain, down_w, c_t, n_t, bn_t, eps=1e-6, has_next_injection=True, fuse_mlp=True)
+    tr_p = [torch.empty_like(st_t), torch.empty_like(st_t), torch.empty_like(bn_t), torch.empty_like(inj_t)]
+    tr_f = [torch.empty_like(st_t), torch.empty_like(st_t), torch.empty_like(bn_t), torch.empty_like(inj_t)]
+
+    def run_tiled():
+        for dst, out in (
+            (tr_p, launch_tiled_combine_down(st_t, b_t, inj_t, gain, down_w, spec=tp_p)),
+            (tr_f, launch_tiled_combine_down(st_t, r_t, inj_t, gain, down_w, spec=tp_f, shared_projected=s_t, shared_gate=sg_t)),
+        ):
+            for d, s in zip(dst, out, strict=True):
+                d.copy_(s)
+
+    aot_forward(run_tiled)(run_tiled)
+    for a, b in zip(tr_f, tr_p, strict=True):
+        assert torch.equal(a, b)
 
 
 def test_prepared_mtp_m1_combine_mix_compiled_parity(monkeypatch):

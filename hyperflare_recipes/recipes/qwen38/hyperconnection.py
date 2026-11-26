@@ -214,7 +214,8 @@ class PreparedHyperconnection:
 
     def prepare_combine_norm(self, following: PreparedHyperconnection, *,
                              priming_state: torch.Tensor, session: PreparationSession,
-                             name: str, fuse_mlp: bool = False) -> None:
+                             name: str, fuse_mlp: bool = False,
+                             allow_combine_mix: bool = True) -> None:
         if self.injection is None:
             raise ValueError("the final hyperconnection mixer has no residual injection")
         self.following = following
@@ -225,7 +226,7 @@ class PreparedHyperconnection:
         self._triton_m1_combine_mix_mlp = None
         self._triton_tiled_combine_down = None
         self._triton_tiled_combine_down_mlp = None
-        if supports_m1_combine_mix(
+        if allow_combine_mix and supports_m1_combine_mix(
             self.tokens,
             following.tokens,
             following.lowrank,
@@ -251,7 +252,7 @@ class PreparedHyperconnection:
             else:
                 self._triton_m1_combine_mix = spec
             return
-        if supports_tiled_combine_down(
+        if allow_combine_mix and supports_tiled_combine_down(
             self.tokens,
             following.tokens,
             following.lowrank,
@@ -276,6 +277,7 @@ class PreparedHyperconnection:
                 self._triton_tiled_combine_down_mlp = spec
             else:
                 self._triton_tiled_combine_down = spec
+            return
         if supports_triton_combine_norm(self.tokens, device, fuse_mlp=fuse_mlp):
             if fuse_mlp:
                 self._triton_combine_norm_mlp = warmup_combine_norm(

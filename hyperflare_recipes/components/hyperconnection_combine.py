@@ -85,22 +85,22 @@ def _combine_norm_5x512(
         b4 = tl.load(BLOCK + b_base + 2048 + k).to(tl.float32)
 
     if EVICT_RES:
-        c0 = (tl.load(STATE + s_base + k, eviction_policy="evict_first").to(tl.float32) + scale * b0).to(tl.bfloat16)
-        c1 = (tl.load(STATE + s_base + 512 + k, eviction_policy="evict_first").to(tl.float32) + scale * b1).to(tl.bfloat16)
-        c2 = (tl.load(STATE + s_base + 1024 + k, eviction_policy="evict_first").to(tl.float32) + scale * b2).to(tl.bfloat16)
-        c3 = (tl.load(STATE + s_base + 1536 + k, eviction_policy="evict_first").to(tl.float32) + scale * b3).to(tl.bfloat16)
-        c4 = (tl.load(STATE + s_base + 2048 + k, eviction_policy="evict_first").to(tl.float32) + scale * b4).to(tl.bfloat16)
+        c0 = tl.fma(scale, b0, tl.load(STATE + s_base + k, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16)
+        c1 = tl.fma(scale, b1, tl.load(STATE + s_base + 512 + k, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16)
+        c2 = tl.fma(scale, b2, tl.load(STATE + s_base + 1024 + k, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16)
+        c3 = tl.fma(scale, b3, tl.load(STATE + s_base + 1536 + k, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16)
+        c4 = tl.fma(scale, b4, tl.load(STATE + s_base + 2048 + k, eviction_policy="evict_first").to(tl.float32)).to(tl.bfloat16)
         tl.store(COMBINED + s_base + k, c0, eviction_policy="evict_first")
         tl.store(COMBINED + s_base + 512 + k, c1, eviction_policy="evict_first")
         tl.store(COMBINED + s_base + 1024 + k, c2, eviction_policy="evict_first")
         tl.store(COMBINED + s_base + 1536 + k, c3, eviction_policy="evict_first")
         tl.store(COMBINED + s_base + 2048 + k, c4, eviction_policy="evict_first")
     else:
-        c0 = (tl.load(STATE + s_base + k).to(tl.float32) + scale * b0).to(tl.bfloat16)
-        c1 = (tl.load(STATE + s_base + 512 + k).to(tl.float32) + scale * b1).to(tl.bfloat16)
-        c2 = (tl.load(STATE + s_base + 1024 + k).to(tl.float32) + scale * b2).to(tl.bfloat16)
-        c3 = (tl.load(STATE + s_base + 1536 + k).to(tl.float32) + scale * b3).to(tl.bfloat16)
-        c4 = (tl.load(STATE + s_base + 2048 + k).to(tl.float32) + scale * b4).to(tl.bfloat16)
+        c0 = tl.fma(scale, b0, tl.load(STATE + s_base + k).to(tl.float32)).to(tl.bfloat16)
+        c1 = tl.fma(scale, b1, tl.load(STATE + s_base + 512 + k).to(tl.float32)).to(tl.bfloat16)
+        c2 = tl.fma(scale, b2, tl.load(STATE + s_base + 1024 + k).to(tl.float32)).to(tl.bfloat16)
+        c3 = tl.fma(scale, b3, tl.load(STATE + s_base + 1536 + k).to(tl.float32)).to(tl.bfloat16)
+        c4 = tl.fma(scale, b4, tl.load(STATE + s_base + 2048 + k).to(tl.float32)).to(tl.bfloat16)
         tl.store(COMBINED + s_base + k, c0)
         tl.store(COMBINED + s_base + 512 + k, c1)
         tl.store(COMBINED + s_base + 1024 + k, c2)
@@ -114,8 +114,8 @@ def _combine_norm_5x512(
         c3.to(tl.float32),
         c4.to(tl.float32),
     )
-    sq = tl.sum(f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3 + f4 * f4, axis=0)
-    inv_rms = tl.rsqrt(sq * (1.0 / H) + EPS)
+    sq = tl.sum(tl.fma(f4, f4, tl.fma(f3, f3, tl.fma(f2, f2, tl.fma(f1, f1, f0 * f0)))), axis=0)
+    inv_rms = tl.rsqrt(tl.fma(sq, 1.0 / H, EPS))
 
     tl.store(NORMALIZED + s_base + k, (f0 * inv_rms * tl.load(GAIN + g_base + k).to(tl.float32)).to(tl.bfloat16))
     tl.store(NORMALIZED + s_base + 512 + k, (f1 * inv_rms * tl.load(GAIN + g_base + 512 + k).to(tl.float32)).to(tl.bfloat16))
@@ -132,7 +132,9 @@ def supports_triton_combine_norm(
     streams: int = 4,
     fuse_mlp: bool = False,
 ) -> bool:
-    min_tokens = 2 if fuse_mlp else 1024
+    # 4 CTAs/token at 4 warps/CTA reaches full SM120 occupancy at 64 tokens (256 CTAs);
+    # below 64 tokens tuned b12x _PackedCombineNorm (10 warps/CTA) + Inductor add wins.
+    min_tokens = 64 if fuse_mlp else 1024
     return (
         device.type == "cuda"
         and torch.cuda.get_device_capability(device) == (12, 0)
@@ -162,6 +164,7 @@ def warmup_combine_norm(
         "S": 4,
         "EVICT_RES": evict_res,
         "FUSE_MLP": bool(fuse_mlp),
+        "enable_fp_fusion": False,
     }
     shared_gate = injection_logits[:, :1]
     warmup_triton(
@@ -280,11 +283,11 @@ def _combine_norm_down_m1_split4(
         b3 = tl.load(BLOCK + 1536 + k).to(tl.float32)
         b4 = tl.load(BLOCK + 2048 + k).to(tl.float32)
 
-    c0 = (tl.load(STATE + s_base + k).to(tl.float32) + scale * b0).to(tl.bfloat16)
-    c1 = (tl.load(STATE + s_base + 512 + k).to(tl.float32) + scale * b1).to(tl.bfloat16)
-    c2 = (tl.load(STATE + s_base + 1024 + k).to(tl.float32) + scale * b2).to(tl.bfloat16)
-    c3 = (tl.load(STATE + s_base + 1536 + k).to(tl.float32) + scale * b3).to(tl.bfloat16)
-    c4 = (tl.load(STATE + s_base + 2048 + k).to(tl.float32) + scale * b4).to(tl.bfloat16)
+    c0 = tl.fma(scale, b0, tl.load(STATE + s_base + k).to(tl.float32)).to(tl.bfloat16)
+    c1 = tl.fma(scale, b1, tl.load(STATE + s_base + 512 + k).to(tl.float32)).to(tl.bfloat16)
+    c2 = tl.fma(scale, b2, tl.load(STATE + s_base + 1024 + k).to(tl.float32)).to(tl.bfloat16)
+    c3 = tl.fma(scale, b3, tl.load(STATE + s_base + 1536 + k).to(tl.float32)).to(tl.bfloat16)
+    c4 = tl.fma(scale, b4, tl.load(STATE + s_base + 2048 + k).to(tl.float32)).to(tl.bfloat16)
 
     f0, f1, f2, f3, f4 = (
         c0.to(tl.float32),
@@ -293,7 +296,8 @@ def _combine_norm_down_m1_split4(
         c3.to(tl.float32),
         c4.to(tl.float32),
     )
-    inv_rms = tl.rsqrt(tl.sum(f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3 + f4 * f4, axis=0) * (1.0 / H) + EPS)
+    sq = tl.sum(tl.fma(f4, f4, tl.fma(f3, f3, tl.fma(f2, f2, tl.fma(f1, f1, f0 * f0)))), axis=0)
+    inv_rms = tl.rsqrt(tl.fma(sq, 1.0 / H, EPS))
 
     n0 = (f0 * inv_rms * tl.load(GAIN + s_base + k).to(tl.float32)).to(tl.bfloat16)
     n1 = (f1 * inv_rms * tl.load(GAIN + s_base + 512 + k).to(tl.float32)).to(tl.bfloat16)
@@ -326,14 +330,26 @@ def _combine_norm_down_m1_split4(
     acc = (
         nf0[None, :]
         * tl.load(DOWN_W + wbase + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
-        + nf1[None, :]
-        * tl.load(DOWN_W + wbase + 512 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
-        + nf2[None, :]
-        * tl.load(DOWN_W + wbase + 1024 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
-        + nf3[None, :]
-        * tl.load(DOWN_W + wbase + 1536 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
-        + nf4[None, :]
-        * tl.load(DOWN_W + wbase + 2048 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+    )
+    acc = tl.fma(
+        nf1[None, :],
+        tl.load(DOWN_W + wbase + 512 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32),
+        acc,
+    )
+    acc = tl.fma(
+        nf2[None, :],
+        tl.load(DOWN_W + wbase + 1024 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32),
+        acc,
+    )
+    acc = tl.fma(
+        nf3[None, :],
+        tl.load(DOWN_W + wbase + 1536 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32),
+        acc,
+    )
+    acc = tl.fma(
+        nf4[None, :],
+        tl.load(DOWN_W + wbase + 2048 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32),
+        acc,
     )
     tl.store(PARTIAL + stream * OUT_ROWS + rs, tl.sum(acc, axis=1), mask=rm)
 
@@ -440,6 +456,7 @@ def warmup_m1_combine_mix(
         "OUT_ROWS": out_rows,
         "BR": br,
         "FUSE_MLP": bool(fuse_mlp),
+        "enable_fp_fusion": False,
     }
     partial = torch.empty((4, out_rows), dtype=torch.float32, device=state.device)
     inj_out = torch.empty((1, 4), dtype=torch.bfloat16, device=state.device)
@@ -592,11 +609,11 @@ def _combine_norm_down_tiled_split4(
             other=0.0,
             eviction_policy="evict_first",
         ).to(tl.float32)
-        c = (st + scale[:, None] * b).to(tl.bfloat16)
+        c = tl.fma(scale[:, None], b, st).to(tl.bfloat16)
         tl.store(COMBINED + s_row[:, None] + kk[None, :], c, mask=mm[:, None])
         cf = c.to(tl.float32)
         sq += tl.sum(cf * cf, axis=1)
-    inv_rms = tl.rsqrt(sq * (1.0 / H) + EPS)
+    inv_rms = tl.rsqrt(tl.fma(sq, 1.0 / H, EPS))
 
     pbase = (ms64 * S + stream)[:, None] * OUT_ROWS
 
@@ -734,6 +751,7 @@ def warmup_tiled_combine_down(
         "BM": bm,
         "BK": 64,
         "BK_P1": 128,
+        "enable_fp_fusion": False,
     }
     partial = torch.empty((tokens, 4, out_rows), dtype=torch.float32, device=state.device)
     inj_out = torch.empty((tokens, 4), dtype=torch.bfloat16, device=state.device)

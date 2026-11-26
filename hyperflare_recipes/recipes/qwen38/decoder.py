@@ -772,23 +772,25 @@ class PreparedDecoder:
                 self.final_res_gather_b = PreparedChunkedGatherShards(
                     shard_scratch.residual, layer_scratch.residual, runtime=runtime, session=session,
                     coordinator=coordinator, name=f"{name}.final_res_gather.b")
+        allow_combine_mix = not self.row_shard_dma and not self.pipelined_prefill
         for index, (attn_hc, _, mlp_hc, moe) in enumerate(self.layers):
             if mlp_hc is None:
                 continue
             hc_scratch = shard_scratch if (self.row_shard_dma and index >= 1) else layer_scratch
             attn_hc.prepare_combine_norm(mlp_hc, priming_state=hc_scratch.residual,
-                session=session, name=f"{name}.layer{index}.attn_combine_norm")
+                session=session, name=f"{name}.layer{index}.attn_combine_norm",
+                allow_combine_mix=allow_combine_mix)
             if index != 0 and ((self.sample and not self._single_row_final_mixer) or index + 1 < len(self.layers)):
                 following = self.layers[index + 1][0] if index + 1 < len(self.layers) else self.final_mixer
                 fuse_mlp = (
-                    not self.row_shard_dma
-                    and not self.pipelined_prefill
+                    allow_combine_mix
                     and not self.reductions
                     and moe is not None
                     and not getattr(getattr(moe, "experts", None), "reduces_into_shared", False)
                 )
                 mlp_hc.prepare_combine_norm(following, priming_state=hc_scratch.residual,
-                    session=session, name=f"{name}.layer{index}.mlp_combine_norm", fuse_mlp=fuse_mlp)
+                    session=session, name=f"{name}.layer{index}.mlp_combine_norm",
+                    fuse_mlp=fuse_mlp, allow_combine_mix=allow_combine_mix)
         if self.row_shard_dma:
             for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
                 if index == 0:
