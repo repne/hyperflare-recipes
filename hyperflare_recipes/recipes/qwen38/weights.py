@@ -139,21 +139,10 @@ class QwenWeightLoader(DirectWeightLoader):
             and (self.prefixes is None or name.startswith(self.prefixes))
         }
 
-    def load_gdn_projections(self, prefix: str, *, pack_ba: bool = False) -> dict[str, Weight]:
+    def load_gdn_projections(self, prefix: str) -> dict[str, Weight]:
         qkv = self.shard.fused_partitions((2048, 2048, 6144))
         value = self.shard.partition(6144)
         heads = self.shard.partition(48)
-        if pack_ba and (16480 // self.shard.world_size) % 16 == 0:
-            names = (f"{prefix}.in_proj_qkv", f"{prefix}.in_proj_z", f"{prefix}.in_proj_b", f"{prefix}.in_proj_a")
-            formats = {self.linear_format(name) for name in names}
-            if len(formats) == 1 and next(iter(formats)) in ("mxfp8", "bfloat16"):
-                return {
-                    "in_proj_qkvzba": self.load_linear_group(
-                        (f"{prefix}.in_proj_qkv",) * 3
-                        + (f"{prefix}.in_proj_z", f"{prefix}.in_proj_b", f"{prefix}.in_proj_a"),
-                        row_ranges=(*qkv, value, heads, heads)),
-                    "out_proj": self.load_linear(f"{prefix}.out_proj", columns=value),
-                }
         return {
             "in_proj_qkvz": self.load_linear_group(
                 (f"{prefix}.in_proj_qkv",) * 3 + (f"{prefix}.in_proj_z",),

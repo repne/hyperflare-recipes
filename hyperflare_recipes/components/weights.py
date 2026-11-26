@@ -577,57 +577,6 @@ def quantize_bf16_linear_as_mxfp8(weight, *, retain_scale_rows=True):
     return MXFP8LinearWeight(quantize_mxfp8_rows_torch(source, retain_scale_rows=retain_scale_rows, allocate=persistent_empty), columns, padded, rows)
 
 
-def slice_mxfp8_weight_rows(weight, start: int, end: int):
-    """Zero-copy slice a 128-row-aligned output partition of an MXFP8LinearWeight."""
-    import torch
-    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
-    from b12x.quantization import mxfp8
-
-    if not isinstance(weight, MXFP8LinearWeight):
-        raise TypeError("slice_mxfp8_weight_rows requires an MXFP8LinearWeight")
-    rows = weight.weight
-    if (
-        rows.values_tiled is not None
-        or start < 0
-        or end <= start
-        or end > weight.out_features
-        or start % 128 != 0
-        or (end < weight.out_features and end % 128 != 0)
-    ):
-        raise ValueError(
-            f"MXFP8 row slice [{start}:{end}) requires 128-row-aligned boundaries without values_tiled"
-        )
-    val_slice = rows.values[start:end]
-    srows_slice = None if rows.scale_rows is None else rows.scale_rows[0, start:end, :].unsqueeze(0)
-    smma_storage = mxfp8.dense_scale_storage(rows.scale_mma)
-    tile_start = start // 128
-    tile_end = (end + 127) // 128
-    row_tiles = tile_end - tile_start
-    k_tiles = int(smma_storage.shape[2])
-    # Slice dim 1 after indexing dim 0 so the leading size-1 stride matches row_tiles * k_tiles * 512.
-    smma_slice = smma_storage[0, tile_start:tile_end].as_strided(
-        (1, row_tiles, k_tiles, 32, 4, 4),
-        (row_tiles * k_tiles * 512, k_tiles * 512, 512, 16, 4, 1),
-    )
-    if srows_slice is not None:
-        srows_u8 = srows_slice.view(torch.uint8).as_strided(
-            (1, end - start, int(srows_slice.shape[2])),
-            ((end - start) * int(srows_slice.shape[2]), int(srows_slice.shape[2]), 1),
-        )
-        sliced_rows = mxfp8.dense_rows_from_bases(val_slice, srows_u8, smma_slice)
-    else:
-        logical_shape = (32, 4, row_tiles, 4, k_tiles, 1)
-        logical_stride = (16, 4, k_tiles * 512, 1, 512, row_tiles * k_tiles * 512)
-        scale_mma = smma_slice.view(rows.scale_mma.dtype).as_strided(logical_shape, logical_stride)
-        sliced_rows = mxfp8.MXFP8Rows(val_slice, None, scale_mma, None)
-    return MXFP8LinearWeight(
-        sliced_rows,
-        in_features=weight.in_features,
-        padded_in_features=weight.padded_in_features,
-        out_features=end - start,
-    )
-
-
 def _read_mode():
     """Checkpoint transport for a rank process that allocates only on its own GPU.
 
