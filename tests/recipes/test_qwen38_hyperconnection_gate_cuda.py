@@ -621,7 +621,7 @@ def test_packed_router_gate_moe_compiled_parity(tokens):
             assert torch.equal(n_strided, n_contig)
 
 
-@pytest.mark.parametrize(("tokens", "width"), [(512, 640), (512, 320), (300, 320), (512, 160)])
+@pytest.mark.parametrize(("tokens", "width"), [(512, 640), (512, 320), (300, 320), (512, 160), (4096, 640), (4100, 640)])
 def test_prepared_mlp_fused_swiglu_mxfp8_compiled_parity(tokens, width):
     """Fused SwiGLU + zero-pad + MXFP8 quantize matches unfused b12x SwiGLU + MXFP8 down_proj bit-for-bit."""
     from b12x.norm import hyperconnection
@@ -660,6 +660,10 @@ def test_prepared_mlp_fused_swiglu_mxfp8_compiled_parity(tokens, width):
             session=session, name="fused", workspace=ws, activation_mode="auto",
         )
         assert mlp_fused.activation_plan is None and mlp_fused._down_encoded_bases is not None
+        if tokens >= 4096 and 2 * width >= 1280:
+            assert mlp_fused.up_projection.quantizer_plan is not None
+        else:
+            assert mlp_fused.up_projection.quantizer_plan is None
         ref_up = QuantizedProjection(
             source, w_gu, scratch_ref.gate_up, session=session, name="ref.gate_up",
             workspace=ws, activation_mode="auto",
