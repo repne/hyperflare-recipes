@@ -515,4 +515,98 @@ def test_prepared_decoder_m1_combine_mix_compiled_parity():
         table.close()
 
 
+@pytest.mark.parametrize("tokens", [1, 16, 128, 1024])
+def test_packed_router_gate_moe_compiled_parity(tokens):
+    """Packed [528, 2560] router+shared_gate matches separate BF16 projections and feeds strided combine_norm."""
+    from b12x.preparation import PreparationSession
+    from hyperflare_recipes.components.hyperconnection_combine import launch_combine_norm, warmup_combine_norm
+    from hyperflare_recipes.recipes.qwen38.moe import PreparedQwenMoe, packed_router_gate
+    from ignition.preparation.aot import aot_forward
+    from ignition.preparation.scratch import ScratchArena
+    from tests.recipes.test_qwen38_pipelined_prefill_cuda import _make_nvfp4_moe_weights
+
+    device = torch.device("cuda:0")
+    weights = _make_nvfp4_moe_weights(device, world=1, seed=77 + tokens)
+    packed_w = packed_router_gate(weights)
+    assert packed_w.shape == (528, 2560)
+    assert torch.equal(packed_w[:512], weights.router)
+    assert torch.equal(packed_w[512:513], weights.shared.gate)
+    assert not packed_w[513:].any()
+    # Second call reuses the cached packed storage.
+    assert packed_router_gate(weights) is packed_w
+
+    gen = torch.Generator(device="cpu").manual_seed(900 + tokens)
+    source = (torch.randn((tokens, 2560), generator=gen) * 0.2).bfloat16().to(device)
+    expected_logits = torch.nn.functional.linear(source, weights.router)
+    expected_gate = torch.nn.functional.linear(source, weights.shared.gate)
+
+    arena = ScratchArena(device, overlap=True)
+    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
+        moe = PreparedQwenMoe(
+            source, weights, session=session, name=f"moe_rg_{tokens}",
+            workspace=arena, projection_workspace=arena, prefill=tokens >= 1024,
+        )
+        if moe.concurrent_shared is not None:
+            # Shared gate is computed in router_gate_projection, not on the auxiliary stream.
+            assert len(moe.concurrent_shared.weights) == 2
+        moe.functional(session=session)
+        arena.freeze()
+        arena.finalize()
+        session.freeze()
+
+        routed_buf = torch.empty_like(source)
+        shared_buf = torch.empty_like(source)
+        gate_buf = torch.empty((tokens, 1), dtype=torch.bfloat16, device=device)
+        full_buf = torch.empty_like(source)
+
+        def run():
+            routed, shared_proj, gate = moe.parts_runtime(source)
+            routed_buf.copy_(routed)
+            shared_buf.copy_(shared_proj)
+            gate_buf.copy_(gate)
+            full_buf.copy_(moe(source))
+
+        compiled = aot_forward(run)
+        compiled(run)
+        torch.cuda.synchronize(device)
+
+        # Router adapter and gate adapter match separate linear projections.
+        actual_logits = moe.router_projection(source)
+        actual_gate = moe.shared.gate_projection(source)
+        assert actual_logits.shape == (tokens, 512)
+        assert actual_logits.stride() == (528, 1)
+        assert actual_gate.shape == (tokens, 1)
+        assert actual_gate.stride() == (528, 1)
+        torch.testing.assert_close(actual_logits, expected_logits, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(actual_gate, expected_gate, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gate_buf, expected_gate, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            full_buf,
+            routed_buf + shared_buf * torch.sigmoid(gate_buf),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+        # Verify strided gate (stride=(528, 1)) feeds _combine_norm_5x512 without copy when tokens >= 1024.
+        if tokens >= 1024 and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+            res = torch.randn((tokens, 10240), dtype=torch.bfloat16, device=device) * 0.2
+            inj = torch.randn((tokens, 4), dtype=torch.bfloat16, device=device) * 0.2
+            gain = torch.ones((10240,), dtype=torch.float32, device=device)
+            grid, opts = warmup_combine_norm(
+                res, routed_buf, inj, gain, torch.empty_like(res), torch.empty_like(res),
+                eps=1e-6, fuse_mlp=True,
+            )
+            c_strided, n_strided = launch_combine_norm(
+                res, routed_buf, inj, gain, grid=grid, options=opts,
+                shared_projected=shared_buf, shared_gate=actual_gate,
+            )
+            c_contig, n_contig = launch_combine_norm(
+                res, routed_buf, inj, gain, grid=grid, options=opts,
+                shared_projected=shared_buf, shared_gate=actual_gate.contiguous(),
+            )
+            assert torch.equal(c_strided, c_contig)
+            assert torch.equal(n_strided, n_contig)
+
+
+
 

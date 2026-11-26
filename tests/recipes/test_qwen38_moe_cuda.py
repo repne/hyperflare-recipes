@@ -62,13 +62,13 @@ class ObservedExperts:
 
 
 def observe_moe(moe, readback):
-    projection, routing = moe.router_projection, moe.routing
+    projection, routing = moe.router_gate_projection, moe.routing
     finish = moe.shared.finish_runtime
 
     def project(source):
-        logits = projection(source)
-        readback.router_logits.copy_(logits)
-        return logits
+        packed = projection(source)
+        readback.router_logits.copy_(packed[:, :512])
+        return packed
 
     def route(logits):
         selected = routing(logits)
@@ -83,7 +83,7 @@ def observe_moe(moe, readback):
         readback.shared.output.copy_(finish(projected, gate))
         return output
 
-    moe.router_projection, moe.routing = project, route
+    moe.router_gate_projection, moe.routing = project, route
     moe.experts = ObservedExperts(moe.experts, readback.routed_output)
     moe.shared.finish_runtime = finish_shared
 
