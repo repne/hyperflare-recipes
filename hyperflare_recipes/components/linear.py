@@ -463,13 +463,8 @@ class QuantizedProjection:
                 if self.encoded is not None:
                     encoded_bases = self.encoded_bases
                 elif self.quantizer_plan is not None:
-                    mma_unpadded = source.shape[0] % 128 == 0
-                    encoded_bases = tuple(
-                        torch.empty(shape, dtype=dtype, device=source.device)
-                        if index < 2 or mma_unpadded
-                        else torch.zeros(shape, dtype=dtype, device=source.device)
-                        for index, (shape, dtype) in enumerate(self.encoded_layout)
-                    )
+                    encoded_bases = tuple(torch.zeros(shape, dtype=dtype, device=source.device)
+                                          for shape, dtype in self.encoded_layout)
                 else:
                     raise ValueError("functional preencoded projection requires encoded_bases")
             if self.quantizer_plan is not None:

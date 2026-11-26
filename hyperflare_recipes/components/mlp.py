@@ -127,40 +127,24 @@ class PreparedMLP:
                     or tensor.device != source.device or not tensor.is_contiguous()):
                 raise ValueError("MLP buffers require contiguous BF16 storage with matching geometry and device")
 
-        def projection(input, weight, out, suffix, bias, *, preencoded=None, mxfp8_min_amax=None):
+        def projection(input, weight, out, suffix, bias, *, preencoded=None):
             from hyperflare_recipes.components.block_fp8 import BlockFP8Projection, BlockFP8Weight
 
             if isinstance(weight, BlockFP8Weight):
-                if bias is not None or preencoded is not None or mxfp8_min_amax is not None:
+                if bias is not None or preencoded is not None:
                     raise ValueError("block-FP8 MLP projections do not support bias or preencoded MXFP8 inputs")
                 return BlockFP8Projection(input, weight, out, session=session, name=f"{name}.{suffix}")
             if isinstance(weight, torch.Tensor):
-                if preencoded is not None or mxfp8_min_amax is not None:
+                if preencoded is not None:
                     raise ValueError("unquantized MLP projections do not support preencoded MXFP8 inputs")
                 return UnquantizedProjection(input, weight, out, session=session, name=f"{name}.{suffix}", bias=bias)
             return QuantizedProjection(input, weight, out, session=session,
                                        name=f"{name}.{suffix}", workspace=workspace,
-                                       activation_mode=activation_mode, bias=bias, encoded=preencoded,
-                                       mxfp8_min_amax=mxfp8_min_amax)
+                                       activation_mode=activation_mode, bias=bias, encoded=preencoded)
 
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
 
-        use_cute_up_mxfp8 = (
-            encoded is None
-            and tokens >= 4096
-            and source.is_cuda
-            and not sm103.is_sm103(source.device)
-            and isinstance(weights.gate_up, MXFP8LinearWeight)
-            and workspace is not None
-            and gate_up_bias is None
-            and activation_mode in ("auto", "quantized")
-            and weights.gate_up.padded_in_features == hidden
-            and weights.gate_up.out_features >= 1280
-        )
-        self.up_projection = projection(
-            source, weights.gate_up, gate_up, "gate_up", gate_up_bias,
-            preencoded=encoded, mxfp8_min_amax=0.0 if use_cute_up_mxfp8 else None,
-        )
+        self.up_projection = projection(source, weights.gate_up, gate_up, "gate_up", gate_up_bias, preencoded=encoded)
         fuse_down_mxfp8 = (
             tokens > 256
             and source.is_cuda
