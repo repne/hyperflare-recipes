@@ -1501,11 +1501,17 @@ class PreparedDecoder:
             residual, normalized = self._run_pipelined(runtime, residual, capture)
         else:
             normalized = None
+            prefetched_mix = None
             for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
                 if index == 1:
                     residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
                     normalized = None
-                mixed, injection = attn_hc.mix_runtime(residual, normalized)
+                    prefetched_mix = None
+                if prefetched_mix is not None:
+                    mixed, injection = prefetched_mix
+                    prefetched_mix = None
+                else:
+                    mixed, injection = attn_hc.mix_runtime(residual, normalized)
                 if mlp_hc is None:
                     attention(mixed, runtime.qsa)
                     normalized = None
@@ -1518,14 +1524,32 @@ class PreparedDecoder:
                     block = attention(mixed, runtime.qsa)
                 if self.reductions:
                     block = self.reductions[index][0](block)
-                residual, normalized = attn_hc.combine_norm_runtime(residual, block, injection)
-                mixed, injection = mlp_hc.mix_runtime(residual, normalized)
+                if getattr(attn_hc, "_triton_m1_combine_mix", None) is not None:
+                    residual, mixed, injection = attn_hc.combine_mix_runtime(residual, block, injection)
+                    normalized = None
+                else:
+                    residual, normalized = attn_hc.combine_norm_runtime(residual, block, injection)
+                    mixed, injection = mlp_hc.mix_runtime(residual, normalized)
                 if index == 0 or ((not self.sample or self._single_row_final_mixer) and index + 1 == len(self.layers)):
                     block = moe(mixed)
                     if self.reductions:
                         block = self.reductions[index][1](block)
                     residual = mlp_hc.combine_runtime(residual, block, injection)
                     normalized = None
+                elif not self.reductions and getattr(mlp_hc, "_triton_m1_combine_mix_mlp", None) is not None:
+                    routed, shared_proj, shared_gate = moe.parts_runtime(mixed)
+                    residual, next_mixed, next_inj = mlp_hc.combine_mix_mlp_runtime(
+                        residual, routed, shared_proj, shared_gate, injection,
+                    )
+                    normalized = None
+                    prefetched_mix = (next_mixed, next_inj)
+                elif getattr(mlp_hc, "_triton_m1_combine_mix", None) is not None:
+                    block = moe(mixed)
+                    if self.reductions:
+                        block = self.reductions[index][1](block)
+                    residual, next_mixed, next_inj = mlp_hc.combine_mix_runtime(residual, block, injection)
+                    normalized = None
+                    prefetched_mix = (next_mixed, next_inj)
                 elif not self.reductions and getattr(mlp_hc, "_triton_combine_norm_mlp", None) is not None:
                     routed, shared_proj, shared_gate = moe.parts_runtime(mixed)
                     residual, normalized = mlp_hc.combine_norm_mlp_runtime(
@@ -1540,6 +1564,8 @@ class PreparedDecoder:
                     self.layer_outputs[index].copy_(residual)
                 if index in self.context_layers:
                     self._capture_context_layer(capture, index, residual)
+            if prefetched_mix is not None and self.sample and hidden is None and not self._single_row_final_mixer:
+                hidden = prefetched_mix[0]
         if not self.sample:
             self.state.finish_runtime(runtime, None, residual)
             if self.completion_recorder is not None:

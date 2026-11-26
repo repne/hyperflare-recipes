@@ -15,8 +15,11 @@ from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 
 from hyperflare_recipes.components.hyperconnection_combine import (
     launch_combine_norm,
+    launch_m1_combine_mix,
+    supports_m1_combine_mix,
     supports_triton_combine_norm,
     warmup_combine_norm,
+    warmup_m1_combine_mix,
 )
 from hyperflare_recipes.components.hyperconnection_gate import PreparedHyperconnectionGate, PreparedShardedHyperconnectionGate
 from hyperflare_recipes.components.linear import UnquantizedProjection
@@ -215,6 +218,33 @@ class PreparedHyperconnection:
         device = self.scratch.normalized.device
         self._triton_combine_norm = None
         self._triton_combine_norm_mlp = None
+        self._triton_m1_combine_mix = None
+        self._triton_m1_combine_mix_mlp = None
+        if supports_m1_combine_mix(
+            self.tokens,
+            following.tokens,
+            following.lowrank,
+            device,
+            following_gate_impl=getattr(following.gate, "implementation", None),
+        ):
+            spec = warmup_m1_combine_mix(
+                priming_state,
+                self.scratch.block_input,
+                self.scratch.injection_logits,
+                following.norm_gain,
+                following.down.weight,
+                following.gate.weight,
+                self.scratch.gate_workspace,
+                following.scratch.normalized[:self.tokens],
+                following.scratch.block_input[:self.tokens],
+                eps=following.eps,
+                has_next_injection=following.injection is not None,
+                fuse_mlp=fuse_mlp,
+            )
+            if fuse_mlp:
+                self._triton_m1_combine_mix_mlp = spec
+            else:
+                self._triton_m1_combine_mix = spec
         if supports_triton_combine_norm(self.tokens, device):
             if fuse_mlp:
                 self._triton_combine_norm_mlp = warmup_combine_norm(
@@ -304,4 +334,28 @@ class PreparedHyperconnection:
             residual, routed, injection, self.following.norm_gain,
             grid=grid, options=options,
             shared_projected=shared_projected, shared_gate=shared_gate,
+        )
+
+    def combine_mix_runtime(self, residual, block_output, injection):
+        return launch_m1_combine_mix(
+            residual,
+            block_output,
+            injection,
+            self.following.norm_gain,
+            self.following.down.weight,
+            self.following.gate.weight,
+            spec=self._triton_m1_combine_mix,
+        )
+
+    def combine_mix_mlp_runtime(self, residual, routed, shared_projected, shared_gate, injection):
+        return launch_m1_combine_mix(
+            residual,
+            routed,
+            injection,
+            self.following.norm_gain,
+            self.following.down.weight,
+            self.following.gate.weight,
+            spec=self._triton_m1_combine_mix_mlp,
+            shared_projected=shared_projected,
+            shared_gate=shared_gate,
         )

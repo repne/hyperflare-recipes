@@ -230,3 +230,289 @@ def test_triton_combine_norm_compiled_parity(rows: int, fuse_mlp: bool):
         torch.testing.assert_close(comb_buf, expected_comb, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(norm_buf, expected_norm, rtol=2e-2, atol=2e-2)
 
+
+@pytest.mark.parametrize("has_next_injection", [True, False])
+@pytest.mark.parametrize("fuse_mlp", [False, True])
+def test_triton_m1_combine_mix_compiled_parity(has_next_injection: bool, fuse_mlp: bool):
+    from b12x.norm.hyperconnection import reference
+    from ignition.preparation.aot import aot_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from hyperflare_recipes.recipes.qwen38.hyperconnection import (
+        HyperconnectionScratch,
+        PreparedHyperconnection,
+    )
+
+    device = torch.device("cuda:0")
+    first_mod = _make_hc_module(device, has_injection=True, seed=7000 + int(has_next_injection))
+    next_mod = _make_hc_module(device, has_injection=has_next_injection, seed=8000 + int(fuse_mlp))
+    gen = torch.Generator(device="cpu").manual_seed(9000 + int(has_next_injection) * 2 + int(fuse_mlp))
+    residual = (torch.randn((1, 10240), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    routed = (torch.randn((1, 2560), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    shared = (torch.randn((1, 2560), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    sgate = (torch.randn((1, 1), generator=gen) * 0.5).bfloat16().to(device).contiguous()
+    inj = (torch.randn((1, 336), generator=gen) * 0.5).bfloat16().to(device)[:, 320:324]
+
+    block_ref = routed + shared * torch.sigmoid(sgate) if fuse_mlp else routed
+    expected_comb = reference.combine(residual, block_ref, inj, streams=4)
+    expected_norm = reference.grouped_rmsnorm(expected_comb, next_mod.hc_norm.weight, streams=4, eps=1e-6)
+    expected_down = torch.nn.functional.linear(expected_norm, next_mod.input_mix_weight_down.weight)
+    expected_bottle = reference.scaled_silu(expected_down, streams=4)
+    expected_logits = torch.nn.functional.linear(expected_bottle, next_mod.input_mix_weight_up.weight)
+    expected_mixed = reference.gate_mean(expected_norm, expected_logits, streams=4)
+    expected_next_inj = (
+        torch.nn.functional.linear(expected_norm, next_mod.block_inject_weight.weight)
+        if has_next_injection
+        else None
+    )
+
+    with torch.inference_mode(), RecordedPreparationSession(
+        device=device,
+        checkpoint=f"test-m1-cm-{int(has_next_injection)}-{int(fuse_mlp)}",
+        workload_schema="test-m1-cm",
+        numerical_policy="bf16",
+        autotune_effort="off",
+    ) as session:
+        scratch = HyperconnectionScratch.allocate(1, device)
+        priming = torch.zeros_like(scratch.normalized)
+        first = PreparedHyperconnection(first_mod, scratch, priming_state=priming, session=session, name="first")
+        following = PreparedHyperconnection(next_mod, scratch, priming_state=priming, session=session, name="next")
+        first.prepare_combine_norm(following, priming_state=priming, session=session, name="cn", fuse_mlp=fuse_mlp)
+        first.functional(session=session)
+        following.functional(session=session)
+        session.tune(show_progress=False)
+
+        if torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+            if fuse_mlp:
+                assert first._triton_m1_combine_mix_mlp is not None
+            else:
+                assert first._triton_m1_combine_mix is not None
+
+        comb_buf = torch.empty_like(residual)
+        mix_buf = torch.empty((1, 2560), dtype=torch.bfloat16, device=device)
+        inj_buf = torch.empty((1, 4), dtype=torch.bfloat16, device=device) if has_next_injection else None
+
+        def run():
+            if fuse_mlp:
+                c, m, ni = first.combine_mix_mlp_runtime(residual, routed, shared, sgate, inj)
+            else:
+                c, m, ni = first.combine_mix_runtime(residual, routed, inj)
+            comb_buf.copy_(c)
+            mix_buf.copy_(m)
+            if ni is not None:
+                inj_buf.copy_(ni)
+            else:
+                assert inj_buf is None
+
+        compiled = aot_forward(run)
+        compiled(run)
+        torch.testing.assert_close(comb_buf, expected_comb, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(mix_buf, expected_mixed, rtol=2e-2, atol=2e-2)
+        if has_next_injection:
+            torch.testing.assert_close(inj_buf, expected_next_inj, rtol=2e-2, atol=2e-2)
+
+
+def test_prepared_decoder_m1_combine_mix_compiled_parity():
+    """4-layer M=1 compiled decode with fused combine_mix matches unfused combine_norm + mix across PLE and final_mixer."""
+    from hyperflare_recipes.components.parallel import TensorParallelShard
+    from hyperflare_recipes.recipes.qwen38.attention import QSAState, RotaryTables
+    from hyperflare_recipes.recipes.qwen38.decoder import DecoderScratch, PreparedDecoder, PreparedDecoderForward
+    from hyperflare_recipes.recipes.qwen38.decoder_state import DecoderInputs, PreparedDecoderState
+    from hyperflare_recipes.recipes.qwen38.sampling import DeviceRequestState
+    from hyperflare_recipes.recipes.qwen38.state import HybridStatePool
+    from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
+    from ignition.components.readiness import ReadinessTimings
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from tests.recipes.test_qwen38_pipelined_prefill_cuda import (
+        _make_mini_model_weights,
+        _make_synthetic_ple_table,
+    )
+
+    device = torch.device("cuda:0")
+    shard = TensorParallelShard(0, 1)
+    weights = _make_mini_model_weights(device, shard, num_layers=4)
+    context, num_pages, slots = 4096, 64, 4
+    table = _make_synthetic_ple_table(device, tokens=1)
+    frame = torch.zeros(1, dtype=torch.int32, device=device)
+    sequence = torch.zeros(1, dtype=torch.int64, device=device)
+    table.sequence = sequence
+    table.timings = ReadinessTimings.allocate(frame, 1)
+    rotary = RotaryTables.allocate(weights.tree.config.text_config, context, device)
+
+    def build_env():
+        pool = HybridStatePool.allocate(slots + 1, device, speculative_tokens=7, world_size=1)
+        requests = DeviceRequestState.allocate(device, capacity=slots)
+        inputs = DecoderInputs.allocate(device, context=context, tokens=1, capacity=slots)
+        cache = {3: QSAState.allocate(pages=num_pages, slots=slots + 1, device=device, draft_tokens=7, kv_heads=2)}
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + 1), device=device)
+        return pool, requests, inputs, cache, completion
+
+    def init_env(req, pool, qsa_st, comp):
+        pool.backing.zero_()
+        qsa_st.main_k_cache.zero_()
+        qsa_st.main_v_cache.zero_()
+        qsa_st.compressed_k_cache.zero_()
+        qsa_st.raw_k_ring.zero_()
+        qsa_st.raw_logical_positions.fill_(-1)
+        qsa_st.raw_rope_positions.fill_(-1)
+        qsa_st.raw_interval_start_positions.fill_(-1)
+        comp.records.zero_()
+        req.generation.zero_()
+        req.status.zero_()
+        req.error_code.zero_()
+        req.consumed_tokens.zero_()
+        req.generated_tokens.zero_()
+        req.pending_token.fill_(-1)
+        req.ple_history.fill_(248044)
+        req.rng_counter.zero_()
+        req.seed.fill_(12345)
+        req.parameters.zero_()
+        req.parameters[0].copy_(torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0, 0.0], device=device))
+        req.top_k.fill_(1)
+        req.max_new_tokens.fill_(16)
+        req.eos_count.zero_()
+        req.histogram.zero_()
+        req.grammar_enabled.zero_()
+        req.status[0] = 1
+        req.generation[0] = 7
+        req.consumed_tokens[0] = 1
+        req.pending_token[0] = 42
+
+    def stage_step(inp, *, active: bool):
+        inp.request_state_rows.zero_()
+        inp.request_state_rows[0, 0] = 1
+        inp.row_slot_ids.fill_(-1)
+        inp.row_slot_ids[0] = 0
+        inp.row_generations.zero_()
+        inp.row_generations[0] = 7
+        inp.live_rows[0] = 1 if active else 0
+        inp.query_lengths.zero_()
+        inp.query_lengths[0] = 1 if active else 0
+        inp.sample_enabled.zero_()
+        inp.sample_enabled[0] = 1 if active else 0
+        inp.token_ids.fill_(248044)
+        inp.prefill_positions.zero_()
+        inp.page_tables.fill_(-1)
+        if active:
+            inp.page_tables[0, 0] = 0
+
+    try:
+        ref_pool, ref_req, ref_in, ref_cache, ref_comp = build_env()
+        fused_pool, fused_req, fused_in, fused_cache, fused_comp = build_env()
+        with RecordedPreparationSession(
+            device=device,
+            checkpoint="test_qwen38_m1_combine_mix",
+            workload_schema="test_qwen38_m1_combine_mix",
+            numerical_policy="default",
+            autotune_effort="off",
+        ) as session:
+            arena = ScratchArena(device, overlap=True)
+            session.register_scratch(arena)
+            ref_scratch = DecoderScratch.allocate(1, device, sample_rows=1, world_size=1)
+            ref_state = PreparedDecoderState(ref_in, ref_req, ref_pool, tokens=1, rows=1, mode="decode")
+            ref_dec = PreparedDecoder(
+                weights, ref_scratch, ref_state, ref_cache, rotary, table, arena,
+                ref_comp, frame, sequence, session=session, name="ref_m1",
+                max_cache_pages=num_pages, sample=True,
+            )
+            fused_scratch = DecoderScratch.allocate(1, device, sample_rows=1, world_size=1)
+            fused_state = PreparedDecoderState(fused_in, fused_req, fused_pool, tokens=1, rows=1, mode="decode")
+            fused_dec = PreparedDecoder(
+                weights, fused_scratch, fused_state, fused_cache, rotary, table, arena,
+                fused_comp, frame, sequence, session=session, name="fused_m1",
+                max_cache_pages=num_pages, sample=True,
+            )
+            ref_dec.functional(session=session)
+            ref_dec.release_outputs()
+            fused_dec.functional(session=session)
+            fused_dec.release_outputs()
+            session.tune(show_progress=False)
+
+            # Disable fused combine_mix only on ref_dec to compare against unfused combine_norm + mix_runtime.
+            for attn_hc, _, mlp_hc, _ in ref_dec.layers:
+                attn_hc._triton_m1_combine_mix = None
+                attn_hc._triton_m1_combine_mix_mlp = None
+                mlp_hc._triton_m1_combine_mix = None
+                mlp_hc._triton_m1_combine_mix_mlp = None
+
+            if torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+                assert fused_dec.layers[0][0]._triton_m1_combine_mix is not None
+                assert getattr(fused_dec.layers[0][2], "_triton_m1_combine_mix_mlp", None) is None
+                assert fused_dec.layers[1][2]._triton_m1_combine_mix_mlp is not None
+                assert fused_dec.layers[3][2]._triton_m1_combine_mix_mlp is not None
+
+            ref_fwd = PreparedDecoderForward(ref_dec)
+            fused_fwd = PreparedDecoderForward(fused_dec)
+            ref_compiled = compile_forward(ref_fwd)
+            fused_compiled = compile_forward(fused_fwd)
+
+            stream = torch.cuda.Stream(device=device)
+            ref_graph = torch.cuda.CUDAGraph()
+            fused_graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.stream(stream):
+                    ref_compiled()
+                    fused_compiled()
+                stream.synchronize()
+                with torch.cuda.graph(ref_graph, stream=stream):
+                    ref_compiled()
+                with torch.cuda.graph(fused_graph, stream=stream):
+                    fused_compiled()
+                stream.synchronize()
+
+                init_env(ref_req, ref_pool, ref_cache[3], ref_comp)
+                init_env(fused_req, fused_pool, fused_cache[3], fused_comp)
+                sequence.fill_(1)
+                stage_step(ref_in, active=True)
+                stage_step(fused_in, active=True)
+                with torch.cuda.stream(stream):
+                    ref_graph.replay()
+                    fused_graph.replay()
+                stream.synchronize()
+
+                assert torch.equal(fused_req.pending_token, ref_req.pending_token)
+                assert torch.equal(fused_comp.records, ref_comp.records)
+                # FUSE_MLP contracts routed + shared * sigmoid(gate) via fma.rn.bf16x2 (1 BF16 ULP vs
+                # separate BF16 mul + add), which propagates across 4 random synthetic layers.
+                rel_hidden = (
+                    (fused_pool.last_hidden[1].float() - ref_pool.last_hidden[1].float()).norm()
+                    / ref_pool.last_hidden[1].float().norm().clamp_min(1e-6)
+                ).item()
+                assert rel_hidden < 3e-2, f"last_hidden diverged: rel_l2={rel_hidden:.6g}"
+                torch.testing.assert_close(fused_pool.last_hidden[1], ref_pool.last_hidden[1], rtol=5e-2, atol=1e-1)
+
+                # Inactive replay must preserve persistent state bit-for-bit.
+                snap_backing = fused_pool.backing.clone()
+                snap_pending = fused_req.pending_token.clone()
+                stage_step(fused_in, active=False)
+                with torch.cuda.stream(stream):
+                    fused_graph.replay()
+                stream.synchronize()
+                assert torch.equal(fused_pool.backing, snap_backing)
+                assert torch.equal(fused_req.pending_token, snap_pending)
+
+                # With FUSE_MLP disabled (the TP>1 path), combine_mix matches unfused bit-for-bit
+                # across all 4 layers, PLE boundary, and final_mixer.
+                for _, _, mlp_hc, _ in fused_dec.layers:
+                    if getattr(mlp_hc, "_triton_m1_combine_mix_mlp", None) is not None:
+                        cn_grid, cn_opts, gate_grid, gate_opts, out_rows = mlp_hc._triton_m1_combine_mix_mlp
+                        plain_opts = dict(cn_opts, FUSE_MLP=False)
+                        mlp_hc._triton_m1_combine_mix = (cn_grid, plain_opts, gate_grid, gate_opts, out_rows)
+                        mlp_hc._triton_m1_combine_mix_mlp = None
+                init_env(fused_req, fused_pool, fused_cache[3], fused_comp)
+                sequence.fill_(1)
+                stage_step(fused_in, active=True)
+                fused_fwd()
+                torch.cuda.synchronize(device)
+                assert torch.equal(fused_pool.last_hidden[1], ref_pool.last_hidden[1])
+                assert torch.equal(fused_req.pending_token, ref_req.pending_token)
+            finally:
+                stream.synchronize()
+                ref_graph.reset()
+                fused_graph.reset()
+    finally:
+        table.close()
+
+
+
