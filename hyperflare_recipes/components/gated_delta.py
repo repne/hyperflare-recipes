@@ -284,12 +284,8 @@ class PreparedGDN:
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
 
         self.output_encoding = None
-        if (prepare_projections
-                and (mode == "prefill" or (records is not None and self.tokens > 28))
-                and partitions is None
-                and projection_workspace is not None
-                and not sm103.is_sm103(self.device)
-                and isinstance(projections["out_proj"], MXFP8LinearWeight)):
+        if (prepare_projections and mode == "prefill" and partitions is None
+                and not sm103.is_sm103(self.device) and isinstance(projections["out_proj"], MXFP8LinearWeight)):
             self.output_encoding = (scratch.mxfp8_output if gdn_buffers is None
                                    else scratch.allocate_mxfp8_output(buffers=gdn_buffers))
 
