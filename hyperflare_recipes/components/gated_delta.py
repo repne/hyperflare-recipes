@@ -601,7 +601,7 @@ class PreparedGDN:
                                  live=metadata.num_tokens)
         return (recurrence if gated is None else gated).view(self.tokens, -1), encoded
 
-    def _functional(self, source, *, records=None, metadata=None, partitions=None, input_encoded_bases=None):
+    def project_input_runtime(self, source, *, input_encoded_bases=None):
         if not self._functional_ready:
             raise RuntimeError("functional GDN requires completed sequence binding finalization")
         proj_kwargs = {} if input_encoded_bases is None else {"encoded_bases": input_encoded_bases}
@@ -619,6 +619,10 @@ class PreparedGDN:
         if qkvz is not None:
             projected, z = qkvz.split((10240 // self.world_size, 6144 // self.world_size), dim=-1)
         b, a = ba.chunk(2, dim=-1)
+        return projected, z, a, b, qkvz, ba
+
+    def finish_sequence_runtime(self, projected, z, a, b, *, qkvz=None, ba=None,
+                                records=None, metadata=None, partitions=None):
         if not self._has_partitions:
             if metadata is None:
                 gated, encoded = self._functional_sequence(projected, z, a, b, records=records)
@@ -641,6 +645,11 @@ class PreparedGDN:
         if encoded is None:
             return self.projections["out_proj"](gated)
         return self.projections["out_proj"](gated, encoded_bases=encoded)
+
+    def _functional(self, source, *, records=None, metadata=None, partitions=None, input_encoded_bases=None):
+        projected, z, a, b, qkvz, ba = self.project_input_runtime(source, input_encoded_bases=input_encoded_bases)
+        return self.finish_sequence_runtime(projected, z, a, b, qkvz=qkvz, ba=ba,
+                                            records=records, metadata=metadata, partitions=partitions)
 
     def __call__(self, source: torch.Tensor, *, records=None, metadata=None, partitions=None,
                  input_encoded_bases=None) -> torch.Tensor:

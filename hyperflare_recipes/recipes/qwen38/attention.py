@@ -511,11 +511,14 @@ class PreparedAttention:
         common_constants, send = self.sharded.select_row_runtime(source, bindings, dynamic, self.workspace_bytes)
         return RowGatherStage(gate, query, metadata, bindings, dynamic, common_constants, send)
 
-    def post_gather_runtime(self, stage: RowGatherStage, *, gather_dependencies=()) -> torch.Tensor:
-        """Complete row-split group gather, sparse attention, gating, and output projection."""
-        self.sharded.finish_row_runtime(
-            stage.bindings, stage.dynamic, stage.common_constants, stage.send,
-            self.workspace_bytes, gather_dependencies=gather_dependencies,
+    def gather_row_runtime(self, stage: RowGatherStage, *, gather_dependencies=()) -> torch.Tensor:
+        """Complete only the cross-rank row-split group-ID gather."""
+        return self.sharded.gather_row_runtime(stage.send, gather_dependencies=gather_dependencies)
+
+    def attend_project_runtime(self, stage: RowGatherStage, gathered: torch.Tensor) -> torch.Tensor:
+        """Expand gathered group IDs, run sparse attention, output gate, and output projection."""
+        self.sharded.attend_row_runtime(
+            stage.bindings, stage.dynamic, stage.common_constants, gathered, self.workspace_bytes,
         )
         attended = stage.bindings["output"]
         if self.sparse is not None:
@@ -523,6 +526,11 @@ class PreparedAttention:
                 selected=stage.bindings["selected_positions"], block_table=stage.metadata.main_block_table,
                 requests=stage.metadata.request_ids, positions=stage.metadata.query_positions)
         return self._gate_and_project_runtime(attended, stage.gate, stage.metadata.request_ids)
+
+    def post_gather_runtime(self, stage: RowGatherStage, *, gather_dependencies=()) -> torch.Tensor:
+        """Complete row-split group gather, sparse attention, gating, and output projection."""
+        gathered = self.gather_row_runtime(stage, gather_dependencies=gather_dependencies)
+        return self.attend_project_runtime(stage, gathered)
 
     def __call__(self, source: torch.Tensor, metadata, *, input_encoded_bases=None) -> torch.Tensor | None:
         if not self.cache_only and self.sharded is not None and self.sharded.mode == "row":

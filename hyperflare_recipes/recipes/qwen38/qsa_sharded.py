@@ -1105,13 +1105,17 @@ class PreparedShardedQSA:
         del select_workspace
         return common_constants, send
 
-    def finish_row_runtime(self, bindings, dynamic, common_constants, send, full_workspace_bytes, *,
-                           gather_dependencies=()):
-        """Gather row-split group IDs, expand positions, and run sparse attention."""
+    def gather_row_runtime(self, send, *, gather_dependencies=()):
+        """Gather row-split selected group IDs across tensor-parallel ranks."""
         if self.mode != "row":
-            raise ValueError("finish_row_runtime requires row-split QSA sharding")
-        device = send.device
-        gathered = self.gather(send, dependencies=gather_dependencies)
+            raise ValueError("gather_row_runtime requires row-split QSA sharding")
+        return self.gather(send, dependencies=gather_dependencies)
+
+    def attend_row_runtime(self, bindings, dynamic, common_constants, gathered, full_workspace_bytes):
+        """Expand gathered group IDs into token positions and run sparse attention."""
+        if self.mode != "row":
+            raise ValueError("attend_row_runtime requires row-split QSA sharding")
+        device = gathered.device
         selected_positions = bindings["selected_positions"]
         gathered_ids = gathered.view(torch.int32)
         _launch(
@@ -1135,6 +1139,12 @@ class PreparedShardedQSA:
                 dynamic["query"], dynamic["request_ids"], dynamic["query_positions"],
             ]
             _qsa_attend_selected_op(attend_reads, bindings["output"], attend_workspace, self.handle)
+
+    def finish_row_runtime(self, bindings, dynamic, common_constants, send, full_workspace_bytes, *,
+                           gather_dependencies=()):
+        """Gather row-split group IDs, expand positions, and run sparse attention."""
+        gathered = self.gather_row_runtime(send, gather_dependencies=gather_dependencies)
+        self.attend_row_runtime(bindings, dynamic, common_constants, gathered, full_workspace_bytes)
 
     def __call__(self, source, bindings, dynamic, full_workspace_bytes):
         if self.mode == "row":

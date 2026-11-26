@@ -676,13 +676,13 @@ class PreparedDecoder:
                     ConcurrentReduceScatter(att_rs_0, workspace=workspaces, session=session,
                         parallel_plans=attn_plans),
                     ConcurrentReduceScatter(att_rs_1, workspace=workspaces, session=session,
-                        parallel_plans=shard_prep_plans),
+                        parallel_plans=moe_compute_plans),
                     ConcurrentGatherShards(ffn_gather_0, workspace=workspaces, session=session,
-                        parallel_plans=shard_prep_plans),
+                        parallel_plans=attn_plans),
                     ConcurrentGatherShards(ffn_gather_1, workspace=workspaces, session=session,
-                        parallel_plans=moe_compute_plans),
+                        parallel_plans=_hc_plans(mlp_hc)),
                     ConcurrentReduceScatter(mlp_rs_0, workspace=workspaces, session=session,
-                        parallel_plans=moe_compute_plans),
+                        parallel_plans=shard_prep_plans),
                     ConcurrentReduceScatter(mlp_rs_1, workspace=workspaces, session=session,
                         parallel_plans=_hc_plans(mlp_hc)),
                 ))
@@ -761,7 +761,7 @@ class PreparedDecoder:
                 mlp_hc.prepare_combine_norm(following, priming_state=hc_scratch.residual,
                     session=session, name=f"{name}.layer{index}.mlp_combine_norm")
         if self.row_shard_dma:
-            for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
+            for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
                 if index == 0:
                     _, cr_att_1, cr_mlp_0, _ = self.pipelined_reductions[0]
                     if mlp_hc is not None:
@@ -769,22 +769,26 @@ class PreparedDecoder:
                         workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
                         workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
                     continue
-                cr_ag_0, _, _, cr_att_1, cr_ffn_0, _, _, cr_mlp_1 = self.pipelined_reductions[index]
+                (cr_ag_0, _, _, _, cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1) = self.pipelined_reductions[index]
                 if mlp_hc is not None:
                     attn_cn = attn_hc.plans["combine_norm"]
-                    workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
+                    workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
                     workspaces.register_parallel(cr_ffn_0.gather.plan, attn_cn)
                     if "combine_norm" in mlp_hc.plans:
+                        workspaces.register_parallel(cr_ffn_1.gather.plan, mlp_hc.plans["combine_norm"])
                         workspaces.register_parallel(cr_mlp_1.reduce.plan, mlp_hc.plans["combine_norm"])
                 if index >= 2:
+                    prev_cr_ffn_1 = self.pipelined_reductions[index - 1][5]
                     prev_cr_mlp_1 = self.pipelined_reductions[index - 1][7]
-                    prev_mlp_cn = self.layers[index - 1][2].plans["combine_norm"]
-                    workspaces.register_parallel(cr_ag_0.gather.plan, prev_mlp_cn)
-                    workspaces.register_parallel(prev_cr_mlp_1.reduce.plan, prev_mlp_cn)
+                    prev_moe = self.layers[index - 1][3]
                     attn_hc_plans = _hc_plans(attn_hc) + (
                         (self.attn_quantizer_plan,) if self.layer_attn_mxfp8[index] else ()
                     )
                     for plan in attn_hc_plans:
+                        workspaces.register_parallel(prev_cr_ffn_1.gather.plan, plan)
+                    for plan in _moe_compute_plans(prev_moe):
+                        workspaces.register_parallel(cr_ag_0.gather.plan, plan)
+                    for plan in _attention_plans(attention, is_qsa=index % 4 == 3):
                         workspaces.register_parallel(prev_cr_mlp_1.reduce.plan, plan)
         elif self.pipelined_prefill:
             for index, (attn_hc, attention, mlp_hc, _) in enumerate(self.layers):
@@ -1077,104 +1081,188 @@ class PreparedDecoder:
         residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
         res_a = torch.index_select(residual, 0, self.shard_rows_a)
         res_b = torch.index_select(residual, 0, self.shard_rows_b)
-        norm_a = norm_b = None
-        pending_prev = None
         sharded_ctx_slots: dict[int, torch.Tensor] = {}
         last_layer = len(self.layers) - 1
 
+        # Prologue for Layer 1: gather half-A attention input while preparing half-B so the
+        # wavefront loop enters every layer with attn_a_full ready.
+        attn_hc1 = self.layers[1][0]
+        cr_ag_0_1 = self.pipelined_reductions[1][0]
+        mixed_a_sh, attn_inj_a = attn_hc1.mix_runtime(res_a, None)
+        attn_a_send = self._prepare_attn_shard(1, mixed_a_sh)
+        p_ag_a = cr_ag_0_1.start(attn_a_send)
+        mixed_b_sh, attn_inj_b = attn_hc1.mix_runtime(res_b, None)
+        attn_b_send = self._prepare_attn_shard(1, mixed_b_sh)
+        attn_a_full = cr_ag_0_1.finish(p_ag_a, attn_b_send)
+        pending_prev_b = None
+
         for index in range(1, len(self.layers)):
             attn_hc, attention, mlp_hc, moe = self.layers[index]
-            (cr_ag_0, cr_ag_1, cr_att_0, cr_att_1,
+            (_, cr_ag_1, cr_att_0, cr_att_1,
              cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1) = self.pipelined_reductions[index]
             is_qsa = index % 4 == 3
             has_row_gather = is_qsa and attention.sharded is not None and attention.sharded.mode == "row"
-
-            if pending_prev is not None:
-                prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_a, prev_mlp_a, prev_inj_a, prev_res_b, prev_inj_b = pending_prev
-                res_a, norm_a = prev_mlp_hc.combine_norm_runtime(prev_res_a, prev_mlp_a, prev_inj_a)
-            mixed_a_sh, attn_inj_a = attn_hc.mix_runtime(res_a, norm_a)
-            attn_a_send = self._prepare_attn_shard(index, mixed_a_sh)
-            if pending_prev is not None:
-                prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, attn_a_send)
-                ag_a_deps = (prev_mlp_b,)
-            else:
-                ag_a_deps = (attn_a_send,)
-
-            p_ag_a = cr_ag_0.start(attn_a_send, dependencies=ag_a_deps)
-            if pending_prev is not None:
-                res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
-                if (index - 1) in self.context_layers:
-                    self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
-                pending_prev = None
-            mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
-            attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
-            attn_a_full = cr_ag_0.finish(p_ag_a, attn_b_send)
-
-            p_ag_b = cr_ag_1.start(attn_b_send, dependencies=(attn_a_full,))
             src_a_att, enc_a_att = self._unpack_attn_gathered(index, attn_a_full)
+
             if mlp_hc is None:
                 attention(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
-                attn_b_full = cr_ag_1.finish(p_ag_b, attention.state.compressed_k_cache)
+                if pending_prev_b is not None:
+                    prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
+                    prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, attention.state.compressed_k_cache)
+                    res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
+                    if (index - 1) in self.context_layers:
+                        self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
+                    mixed_b_sh, _ = attn_hc.mix_runtime(res_b, norm_b)
+                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
+                    ag_b_deps = (prev_mlp_b, attn_b_send)
+                else:
+                    ag_b_deps = (attn_a_full, attn_b_send)
+                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
+                attn_b_full = cr_ag_1.finish(p_ag_b, attn_b_send)
                 src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
                 attention(src_b_att, qsa_b, input_encoded_bases=enc_b_att)
                 self._finish_sharded_context_capture(capture, sharded_ctx_slots)
                 return residual, None
 
             if not is_qsa:
-                out_a = attention(src_a_att, metadata=gdn_a, input_encoded_bases=enc_a_att)
+                # Step 1: overlap half-A input projections with previous layer's half-B MoE RS.
+                proj_a = attention.project_input_runtime(src_a_att, input_encoded_bases=enc_a_att)
+                if pending_prev_b is not None:
+                    prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
+                    prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, proj_a[0])
+                    res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
+                    if (index - 1) in self.context_layers:
+                        self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
+                    mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
+                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
+                    ag_b_deps = (prev_mlp_b, attn_b_send)
+                    pending_prev_b = None
+                else:
+                    ag_b_deps = (attn_a_full, attn_b_send)
+                # Step 2: overlap half-B attention gather with half-A GDN sequence & out_proj.
+                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
+                out_a = attention.finish_sequence_runtime(
+                    *proj_a[:4], qkvz=proj_a[4], ba=proj_a[5], metadata=gdn_a,
+                )
                 attn_b_full = cr_ag_1.finish(p_ag_b, out_a)
+                # Step 3: overlap half-A attention RS with half-B input projections.
                 p_att_a = cr_att_0.start(out_a, dependencies=(attn_b_full,))
                 src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
-                out_b = attention(src_b_att, metadata=gdn_b, input_encoded_bases=enc_b_att)
-                att_a = cr_att_0.finish(p_att_a, out_b)
+                proj_b = attention.project_input_runtime(src_b_att, input_encoded_bases=enc_b_att)
+                att_a = cr_att_0.finish(p_att_a, proj_b[0])
+                # Step 4: prepare half-A FFN shard, then overlap half-A FFN gather with half-B GDN sequence.
+                res_a, norm_a = attn_hc.combine_norm_runtime(res_a, att_a, attn_inj_a)
+                mixed_a_sh, mlp_inj_a = mlp_hc.mix_runtime(res_a, norm_a)
+                ffn_a_send = self._prepare_ffn_shard(moe, mixed_a_sh)
+                p_ffn_a = cr_ffn_0.start(ffn_a_send, dependencies=(att_a, ffn_a_send))
+                out_b = attention.finish_sequence_runtime(
+                    *proj_b[:4], qkvz=proj_b[4], ba=proj_b[5], metadata=gdn_b,
+                )
+                ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
             elif has_row_gather:
+                # Step 1: overlap half-A QKV/selection with previous layer's half-B MoE RS, then gather
+                # QSA group IDs with zero DMA in flight to avoid PCIe contention.
                 stage_a = attention.pre_gather_runtime(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
-                attn_b_full = cr_ag_1.finish(p_ag_b, stage_a.send)
-                out_a = attention.post_gather_runtime(stage_a, gather_dependencies=(attn_b_full,))
-                p_att_a = cr_att_0.start(out_a, dependencies=(out_a,))
+                if pending_prev_b is not None:
+                    prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
+                    prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, stage_a.send)
+                    gathered_a = attention.gather_row_runtime(stage_a, gather_dependencies=(prev_mlp_b,))
+                    res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
+                    if (index - 1) in self.context_layers:
+                        self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
+                    mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
+                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
+                    ag_b_deps = (gathered_a, attn_b_send)
+                    pending_prev_b = None
+                else:
+                    gathered_a = attention.gather_row_runtime(stage_a, gather_dependencies=(attn_a_full,))
+                    ag_b_deps = (gathered_a, attn_b_send)
+                # Step 2: overlap half-B attention gather with half-A sparse attention & o_proj.
+                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
+                out_a = attention.attend_project_runtime(stage_a, gathered_a)
+                attn_b_full = cr_ag_1.finish(p_ag_b, out_a)
+                # Step 3: overlap half-A attention RS with half-B QKV/selection, then gather group IDs.
+                p_att_a = cr_att_0.start(out_a, dependencies=(attn_b_full,))
                 src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
                 stage_b = attention.pre_gather_runtime(src_b_att, qsa_b, input_encoded_bases=enc_b_att)
                 att_a = cr_att_0.finish(p_att_a, stage_b.send)
-                out_b = attention.post_gather_runtime(stage_b, gather_dependencies=(att_a,))
+                gathered_b = attention.gather_row_runtime(stage_b, gather_dependencies=(att_a,))
+                # Step 4: prepare half-A FFN shard, then overlap half-A FFN gather with half-B sparse attention.
+                res_a, norm_a = attn_hc.combine_norm_runtime(res_a, att_a, attn_inj_a)
+                mixed_a_sh, mlp_inj_a = mlp_hc.mix_runtime(res_a, norm_a)
+                ffn_a_send = self._prepare_ffn_shard(moe, mixed_a_sh)
+                p_ffn_a = cr_ffn_0.start(ffn_a_send, dependencies=(gathered_b, ffn_a_send))
+                out_b = attention.attend_project_runtime(stage_b, gathered_b)
+                ffn_a_full = cr_ffn_0.finish(p_ffn_a, out_b)
             else:
                 out_a = attention(src_a_att, qsa_a, input_encoded_bases=enc_a_att)
-                attn_b_full = cr_ag_1.finish(p_ag_b, out_a)
+                if pending_prev_b is not None:
+                    prev_cr_mlp_1, prev_mlp_hc, prev_p_mlp_b, prev_res_b, prev_inj_b = pending_prev_b
+                    prev_mlp_b = prev_cr_mlp_1.finish(prev_p_mlp_b, out_a)
+                    res_b, norm_b = prev_mlp_hc.combine_norm_runtime(prev_res_b, prev_mlp_b, prev_inj_b)
+                    if (index - 1) in self.context_layers:
+                        self._capture_context_layer_sharded(capture, sharded_ctx_slots, index - 1, res_a, res_b)
+                    mixed_b_sh, attn_inj_b = attn_hc.mix_runtime(res_b, norm_b)
+                    attn_b_send = self._prepare_attn_shard(index, mixed_b_sh)
+                    ag_b_deps = (prev_mlp_b, attn_b_send)
+                    pending_prev_b = None
+                else:
+                    ag_b_deps = (attn_a_full, attn_b_send)
+                p_ag_b = cr_ag_1.start(attn_b_send, dependencies=ag_b_deps)
+                attn_b_full = cr_ag_1.finish(p_ag_b, attn_b_send)
                 p_att_a = cr_att_0.start(out_a, dependencies=(attn_b_full,))
                 src_b_att, enc_b_att = self._unpack_attn_gathered(index, attn_b_full)
                 out_b = attention(src_b_att, qsa_b, input_encoded_bases=enc_b_att)
                 att_a = cr_att_0.finish(p_att_a, out_b)
+                res_a, norm_a = attn_hc.combine_norm_runtime(res_a, att_a, attn_inj_a)
+                mixed_a_sh, mlp_inj_a = mlp_hc.mix_runtime(res_a, norm_a)
+                ffn_a_send = self._prepare_ffn_shard(moe, mixed_a_sh)
+                p_ffn_a = cr_ffn_0.start(ffn_a_send, dependencies=(att_a, ffn_a_send))
+                ffn_a_full = cr_ffn_0.finish(p_ffn_a, ffn_a_send)
 
-            p_att_b = cr_att_1.start(out_b, dependencies=(att_a,))
-            res_a, norm_a = attn_hc.combine_norm_runtime(res_a, att_a, attn_inj_a)
-            mixed_a_sh, mlp_inj_a = mlp_hc.mix_runtime(res_a, norm_a)
-            ffn_a_send = self._prepare_ffn_shard(moe, mixed_a_sh)
-            att_b = cr_att_1.finish(p_att_b, ffn_a_send)
+            # Step 5: overlap half-B attention RS with half-A MoE.
+            p_att_b = cr_att_1.start(out_b, dependencies=(ffn_a_full,))
+            moe_a = self._run_ffn_gathered(moe, ffn_a_full)
+            att_b = cr_att_1.finish(p_att_b, moe_a)
 
-            p_ffn_a = cr_ffn_0.start(ffn_a_send, dependencies=(att_b,))
+            # Step 6: overlap half-A MoE RS with half-B FFN shard preparation.
+            p_mlp_a = cr_mlp_0.start(moe_a, dependencies=(att_b,))
             res_b, norm_b = attn_hc.combine_norm_runtime(res_b, att_b, attn_inj_b)
             mixed_b_sh, mlp_inj_b = mlp_hc.mix_runtime(res_b, norm_b)
             ffn_b_send = self._prepare_ffn_shard(moe, mixed_b_sh)
-            ffn_a_full = cr_ffn_0.finish(p_ffn_a, ffn_b_send)
+            mlp_a = cr_mlp_0.finish(p_mlp_a, ffn_b_send)
 
-            p_ffn_b = cr_ffn_1.start(ffn_b_send, dependencies=(ffn_a_full,))
-            moe_a = self._run_ffn_gathered(moe, ffn_a_full)
-            ffn_b_full = cr_ffn_1.finish(p_ffn_b, moe_a)
-
-            p_mlp_a = cr_mlp_0.start(moe_a, dependencies=(ffn_b_full,))
-            moe_b = self._run_ffn_gathered(moe, ffn_b_full)
-            mlp_a = cr_mlp_0.finish(p_mlp_a, moe_b)
-
-            p_mlp_b = cr_mlp_1.start(moe_b, dependencies=(mlp_a,))
             if index < last_layer:
-                pending_prev = (cr_mlp_1, mlp_hc, p_mlp_b, res_a, mlp_a, mlp_inj_a, res_b, mlp_inj_b)
+                next_attn_hc = self.layers[index + 1][0]
+                next_cr_ag_0 = self.pipelined_reductions[index + 1][0]
+                # Step 7: overlap half-B FFN gather with next layer's half-A attention shard prep.
+                p_ffn_b = cr_ffn_1.start(ffn_b_send, dependencies=(mlp_a,))
+                res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
+                next_mixed_a_sh, next_attn_inj_a = next_attn_hc.mix_runtime(res_a, norm_a)
+                next_attn_a_send = self._prepare_attn_shard(index + 1, next_mixed_a_sh)
+                ffn_b_full = cr_ffn_1.finish(p_ffn_b, next_attn_a_send)
+
+                # Step 8: overlap next layer's half-A attention gather with current half-B MoE.
+                p_next_ag_a = next_cr_ag_0.start(next_attn_a_send, dependencies=(ffn_b_full,))
+                moe_b = self._run_ffn_gathered(moe, ffn_b_full)
+                attn_a_full = next_cr_ag_0.finish(p_next_ag_a, moe_b)
+
+                p_mlp_b = cr_mlp_1.start(moe_b, dependencies=(attn_a_full,))
+                attn_inj_a = next_attn_inj_a
+                pending_prev_b = (cr_mlp_1, mlp_hc, p_mlp_b, res_b, mlp_inj_b)
             else:
+                p_ffn_b = cr_ffn_1.start(ffn_b_send, dependencies=(mlp_a,))
                 if self.sample:
                     res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
-                    mlp_b = cr_mlp_1.finish(p_mlp_b, res_a)
-                    res_b, norm_b = mlp_hc.combine_norm_runtime(res_b, mlp_b, mlp_inj_b)
                 else:
                     res_a = mlp_hc.combine_runtime(res_a, mlp_a, mlp_inj_a)
-                    mlp_b = cr_mlp_1.finish(p_mlp_b, res_a)
+                ffn_b_full = cr_ffn_1.finish(p_ffn_b, res_a)
+                moe_b = self._run_ffn_gathered(moe, ffn_b_full)
+                p_mlp_b = cr_mlp_1.start(moe_b, dependencies=(ffn_b_full, moe_b))
+                mlp_b = cr_mlp_1.finish(p_mlp_b, moe_b)
+                if self.sample:
+                    res_b, norm_b = mlp_hc.combine_norm_runtime(res_b, mlp_b, mlp_inj_b)
+                else:
                     res_b = mlp_hc.combine_runtime(res_b, mlp_b, mlp_inj_b)
                 if index in self.context_layers:
                     self._capture_context_layer_sharded(capture, sharded_ctx_slots, index, res_a, res_b)
