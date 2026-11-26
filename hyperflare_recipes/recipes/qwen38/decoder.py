@@ -123,12 +123,10 @@ class ModelWeights:
                 hyperconnection(f"{prefix}.mlp_hyper_connection")
                 if layer % 4 == 3:
                     attention_prefix = f"{prefix}.self_attn"
-                    load_projections = loader.load_qsa_projections
                     names = ("q_norm.weight", "k_norm.weight", "indexer.q_layernorm.weight",
                              "indexer.k_layernorm.weight")
                 else:
                     attention_prefix = f"{prefix}.linear_attn"
-                    load_projections = loader.load_gdn_projections
                     names = ("A_log", "dt_bias", "conv1d.weight", "norm.weight")
                 if layer % 4 == 3:
                     parameters(tuple(f"{attention_prefix}.{name}" for name in names))
@@ -146,7 +144,11 @@ class ModelWeights:
                     module.num_k_heads //= shard.world_size
                     module.num_v_heads //= shard.world_size
                     module.conv_dim //= shard.world_size
-                attention = load_projections(attention_prefix)
+                attention = (
+                    loader.load_qsa_projections(attention_prefix)
+                    if layer % 4 == 3
+                    else loader.load_gdn_projections(attention_prefix, pack_ba=True)
+                )
                 moe = QwenMoeWeights.load(loader, layer)
                 module = tree.get_submodule(f"{prefix}.mlp")
                 module.gate.weight = torch.nn.Parameter(moe.router, requires_grad=False)
@@ -584,6 +586,23 @@ class PreparedDecoder:
         )
         self.layers, self.reductions, self.pipelined_reductions = [], [], []
         layer_attn_mxfp8 = []
+        packed_gdn_scratch = layer_scratch.gdn
+        if (
+            state.mode != "prefill"
+            and layer_scratch.gdn.projected_qkvz.shape[0] < 256
+            and getattr(state, "gdn_partitions", None) is None
+            and any("in_proj_qkvzba" in lw.attention for lw in weights.layers)
+            and layer_scratch.gdn.projected_qkvz.stride(0) != 16480 // weights.shard.world_size
+        ):
+            from hyperflare_recipes.components.gated_delta import GDNScratch
+
+            packed_gdn_scratch = GDNScratch.allocate(
+                layer_scratch.gdn.projected_qkvz.shape[0],
+                layer_scratch.gdn.output.device,
+                world_size=weights.shard.world_size,
+                output=layer_scratch.gdn.output,
+                pack_ba=True,
+            )
         for index, (module, layer_weights) in enumerate(zip(language.layers, weights.layers, strict=True)):
             prefix = f"{name}.layer{index}"
             is_cache_only = self.last_layer_cache_only and index == last_index
@@ -646,8 +665,9 @@ class PreparedDecoder:
                     qsa_shard_mode=qsa_shard_mode, coordinator=coordinator,
                     input_encoded=layer_input_encoded)
             else:
+                gdn_scratch = packed_gdn_scratch if "in_proj_qkvzba" in layer_weights.attention else layer_scratch.gdn
                 attention = PreparedGDN(module.linear_attn, layer_weights.attention, source,
-                    layer_scratch.gdn, state.pool.gdn[index], layer_gdn_meta, mode=state.mode,
+                    gdn_scratch, state.pool.gdn[index], layer_gdn_meta, mode=state.mode,
                     session=session, name=f"{prefix}.gdn", checkpoint_export=False,
                     workspace=workspaces, projection_workspace=workspaces,
                     records=None if gdn_records is None else gdn_records[index], in_place=gdn_in_place,

@@ -558,3 +558,95 @@ def test_prepared_gdn_verify_fused_output_encoding_parity():
     assert (out_fused[:18] == out_ref[:18]).float().mean() > 0.99
     assert torch.equal(out_fused[18:], torch.zeros_like(out_fused[18:]))
     torch.testing.assert_close(rec_fused.delta, rec_ref.delta, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize("retain_scale_rows", [True, False])
+def test_mxfp8_row_slice_and_hybrid_gdn_qkvzba_parity(world_size, retain_scale_rows):
+    """slice_mxfp8_weight_rows aliases storage zero-copy and PreparedGDN splits packed weights on prefill."""
+    from types import SimpleNamespace
+    from b12x.quantization import mxfp8
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from hyperflare_recipes.components.gated_delta import GDNScratch, GDNState, PreparedGDN
+    from hyperflare_recipes.components.linear import QuantizedProjection
+    from hyperflare_recipes.components.recurrent import DeltaMetadata
+    from hyperflare_recipes.components.weights import quantize_bf16_linear_as_mxfp8, slice_mxfp8_weight_rows
+
+    device = torch.device("cuda")
+    qkvz_rows, ba_rows = 16384 // world_size, 96 // world_size
+    gen = torch.Generator(device=device).manual_seed(31 + world_size)
+    dense = (torch.randn((qkvz_rows + ba_rows, 2560), generator=gen, device=device) * 0.02).bfloat16()
+    packed = quantize_bf16_linear_as_mxfp8(dense, retain_scale_rows=retain_scale_rows)
+    alloc_before = torch.cuda.memory_allocated(device)
+    qkvz_w = slice_mxfp8_weight_rows(packed, 0, qkvz_rows)
+    ba_w = slice_mxfp8_weight_rows(packed, qkvz_rows, qkvz_rows + ba_rows)
+    assert torch.cuda.memory_allocated(device) == alloc_before
+    assert qkvz_w.weight.values.untyped_storage().data_ptr() == packed.weight.values.untyped_storage().data_ptr()
+    assert ba_w.weight.values.untyped_storage().data_ptr() == packed.weight.values.untyped_storage().data_ptr()
+    assert (mxfp8.dense_scale_storage(qkvz_w.weight.scale_mma).untyped_storage().data_ptr()
+            == mxfp8.dense_scale_storage(packed.weight.scale_mma).untyped_storage().data_ptr())
+    assert (mxfp8.dense_scale_storage(ba_w.weight.scale_mma).untyped_storage().data_ptr()
+            == mxfp8.dense_scale_storage(packed.weight.scale_mma).untyped_storage().data_ptr())
+    assert (qkvz_w.weight.scale_rows is None) == (not retain_scale_rows)
+    assert (ba_w.weight.scale_rows is None) == (not retain_scale_rows)
+
+    # Verify numerical parity of sliced projections against the full packed projection across M=16 and M=256.
+    for tokens in (16, 256):
+        ws = ScratchArena(device)
+        x = (torch.randn((tokens, 2560), generator=gen, device=device) * 0.2).bfloat16()
+        y_packed = torch.empty((tokens, qkvz_rows + ba_rows), dtype=torch.bfloat16, device=device)
+        y_qkvz = torch.empty((tokens, qkvz_rows), dtype=torch.bfloat16, device=device)
+        y_ba = torch.empty((tokens, ba_rows), dtype=torch.bfloat16, device=device)
+        with RecordedPreparationSession(
+            device=device, checkpoint="test_slice", workload_schema="test_slice",
+            numerical_policy="default", autotune_effort="off",
+        ) as session:
+            session.register_scratch(ws)
+            p_full = QuantizedProjection(x, packed, y_packed, session=session, name="full", workspace=ws,
+                                         activation_mode="auto", allow_bf16_atomic_reduction=False)
+            p_qkvz = QuantizedProjection(x, qkvz_w, y_qkvz, session=session, name="qkvz", workspace=ws,
+                                         activation_mode="auto")
+            p_ba = QuantizedProjection(x, ba_w, y_ba, session=session, name="ba", workspace=ws,
+                                       activation_mode="auto")
+            session.tune(show_progress=False)
+        p_full(x); p_qkvz(x); p_ba(x)
+        torch.testing.assert_close(y_qkvz, y_packed[:, :qkvz_rows], rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(y_ba, y_packed[:, qkvz_rows:], rtol=2e-2, atol=2e-2)
+
+    if not retain_scale_rows:
+        return
+    # Verify PreparedGDN keeps packed in_proj_qkvzba on decode (tokens=16) and zero-copy splits on prefill (tokens=256).
+    out_w = quantize_bf16_linear_as_mxfp8((torch.randn((2560, 6144 // world_size), generator=gen, device=device) * 0.02).bfloat16())
+    module = SimpleNamespace(
+        num_k_heads=16 // world_size, num_v_heads=48 // world_size, head_k_dim=128, head_v_dim=128,
+        conv_dim=10240 // world_size, conv_kernel_size=4, hidden_size=2560, activation="silu",
+        conv1d=SimpleNamespace(weight=torch.zeros((10240 // world_size, 1, 4), dtype=torch.bfloat16, device=device), bias=None),
+        A_log=torch.zeros(48 // world_size, device=device),
+        dt_bias=torch.zeros(48 // world_size, device=device),
+        norm=SimpleNamespace(weight=torch.ones(128, dtype=torch.bfloat16, device=device), activation="sigmoid", variance_epsilon=1e-6),
+    )
+    state = GDNState.allocate(2, device, world_size=world_size)
+    ws = ScratchArena(device)
+    with RecordedPreparationSession(
+        device=device, checkpoint="test_gdn_hybrid", workload_schema="test_gdn_hybrid",
+        numerical_policy="default", autotune_effort="off",
+    ) as session:
+        session.register_scratch(ws)
+        gdn_dec = PreparedGDN(
+            module, {"in_proj_qkvzba": packed, "out_proj": out_w},
+            torch.zeros((16, 2560), dtype=torch.bfloat16, device=device),
+            GDNScratch.allocate(16, device, world_size=world_size, pack_ba=True),
+            state, DeltaMetadata.allocate(16, device), mode="decode", session=session,
+            name="gdn_dec", workspace=ws, projection_workspace=ws, in_place=True,
+        )
+        gdn_pre = PreparedGDN(
+            module, {"in_proj_qkvzba": packed, "out_proj": out_w},
+            torch.zeros((256, 2560), dtype=torch.bfloat16, device=device),
+            GDNScratch.allocate(256, device, world_size=world_size, pack_ba=False),
+            state, DeltaMetadata.allocate(1, device), mode="prefill", session=session,
+            name="gdn_pre", workspace=ws, projection_workspace=ws,
+        )
+        assert gdn_dec.fused_qkvzba and set(gdn_dec.projections) == {"in_proj_qkvzba", "out_proj"}
+        assert not gdn_pre.fused_qkvzba and gdn_pre.fused_qkvz and set(gdn_pre.projections) == {"in_proj_qkvz", "in_proj_ba", "out_proj"}
+        session.tune(show_progress=False)

@@ -282,6 +282,41 @@ class PreparedGDN:
             raise ValueError("GDN requires QKV/Z, packed B/A, and output projection weights")
 
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+        from hyperflare_recipes.components.weights import slice_mxfp8_weight_rows
+
+        # Packed 16480/8240-row in_proj_qkvzba saves one launch on decode/verify (<=128 tokens),
+        # but adds a non-power-of-two tail wave at prefill sizes where 16384/8192 is tile-aligned.
+        # Zero-copy slice at the 128-row boundary when contiguous split scratch is provided.
+        qkvz_width = 16384 // world_size
+        ba_width = 96 // world_size
+        if (
+            self.fused_qkvzba
+            and (mode == "prefill" or self.tokens >= 256 or partitions is not None)
+            and qkvz_width % 128 == 0
+            and scratch.projected_qkvz.is_contiguous()
+            and scratch.projected_ba.is_contiguous()
+        ):
+            packed_weight = projections["in_proj_qkvzba"]
+            if (
+                isinstance(packed_weight, MXFP8LinearWeight)
+                and packed_weight.weight.values_tiled is None
+                and packed_weight.out_features == qkvz_width + ba_width
+            ):
+                projections = {
+                    "in_proj_qkvz": slice_mxfp8_weight_rows(packed_weight, 0, qkvz_width),
+                    "in_proj_ba": slice_mxfp8_weight_rows(packed_weight, qkvz_width, qkvz_width + ba_width),
+                    "out_proj": projections["out_proj"],
+                }
+                self.fused_qkvzba = False
+                self.fused_qkvz = True
+            elif isinstance(packed_weight, torch.Tensor) and packed_weight.shape[0] == qkvz_width + ba_width:
+                projections = {
+                    "in_proj_qkvz": packed_weight[:qkvz_width],
+                    "in_proj_ba": packed_weight[qkvz_width:],
+                    "out_proj": projections["out_proj"],
+                }
+                self.fused_qkvzba = False
+                self.fused_qkvz = True
 
         self.output_encoding = None
         if (prepare_projections
