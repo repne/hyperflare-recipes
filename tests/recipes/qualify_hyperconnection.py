@@ -129,7 +129,11 @@ def qualify(snapshot: Path) -> list[dict]:
                         difference = (actual.float() - expected.float())
                         reports.append({"tokens": tokens, "iteration": iteration, "operation": name,
                             "down_backend": prepared.down.plan.selection.config.backend,
-                            "gate_implementation": prepared.gate.plan.selection.config.implementation,
+                            "gate_implementation": (
+                                prepared.gate.plan.selection.config.implementation
+                                if prepared.gate.plan is not None
+                                else prepared.gate.implementation
+                            ),
                             "max_absolute_error": difference.abs().max().item(),
                             "relative_l2_error": (difference.norm() / expected.float().norm().clamp_min(1e-12)).item()})
                     for label, values in (("fused", following_mixed), ("unfused", unfused_following)):

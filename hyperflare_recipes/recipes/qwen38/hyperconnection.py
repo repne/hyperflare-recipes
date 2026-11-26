@@ -157,14 +157,28 @@ class PreparedHyperconnection:
             raise ValueError("sharded hyperconnections require a matching TP collective")
         if sharded != (scratch.gate_logits is not None):
             raise ValueError("sharded hyperconnections require separate reduced-logit storage")
+        self.injection = None if module.block_inject_weight is None else scratch.injection_logits
+        down_output = scratch.projected_down if self.injection is None else scratch.down_and_injection
+        self.down = UnquantizedProjection(scratch.normalized, packed_down_projection(module),
+            down_output, session=session, name=f"{name}.down")
+        if sharded:
+            self.gate = PreparedShardedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
+                scratch.normalized, scratch.block_input, scratch.gate_workspace, scratch.gate_logits,
+                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.gate")
+        else:
+            self.gate = PreparedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
+                scratch.normalized, scratch.block_input, scratch.gate_workspace,
+                session=session, name=f"{name}.gate", projected_down=scratch.projected_down)
+
         caps = hc.Caps(device=device, max_tokens=self.tokens, hidden_size=2560, streams=4, lowrank=self.lowrank)
         self.plans = {}
         self.bindings = {}
         priming_arguments = scratch.priming_arguments(priming_state, self.norm_gain)
         invocations = {
             "grouped_rmsnorm": {"eps": self.eps, "zero_centered": False, "weight_dtype": "float32"},
-            "scaled_silu": {},
         }
+        if not getattr(self.gate, "fuses_scaled_silu", False):
+            invocations["scaled_silu"] = {}
         if module.block_inject_weight is not None:
             invocations["combine"] = {"output_mode": "provided"}
         for operation, options in invocations.items():
@@ -186,19 +200,6 @@ class PreparedHyperconnection:
                     normalized=scratch.normalized, bottleneck=scratch.bottleneck, block_input=scratch.block_input)
 
             register_finalizer(session, finalize)
-
-        self.injection = None if module.block_inject_weight is None else scratch.injection_logits
-        down_output = scratch.projected_down if self.injection is None else scratch.down_and_injection
-        self.down = UnquantizedProjection(scratch.normalized, packed_down_projection(module),
-            down_output, session=session, name=f"{name}.down")
-        if sharded:
-            self.gate = PreparedShardedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
-                scratch.normalized, scratch.block_input, scratch.gate_workspace, scratch.gate_logits,
-                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.gate")
-        else:
-            self.gate = PreparedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
-                scratch.normalized, scratch.block_input, scratch.gate_workspace,
-                session=session, name=f"{name}.gate")
 
     def prepare_combine_norm(self, following: PreparedHyperconnection, *,
                              priming_state: torch.Tensor, session: PreparationSession,
@@ -240,6 +241,8 @@ class PreparedHyperconnection:
                 self.plans["grouped_rmsnorm"].handle, False)
         projected = self.down(normalized)
         injection = projected[:, self.lowrank:self.lowrank + 4] if self.has_injection else None
+        if getattr(self.gate, "fuses_scaled_silu", False):
+            return self.gate(projected[:, :self.lowrank], normalized), injection
         bottleneck = torch.empty((self.tokens, self.lowrank), dtype=torch.bfloat16, device=residual.device)
         torch.ops.b12x.hyperconnection_scaled_silu(projected[:, :self.lowrank], bottleneck,
                                                   self.plans["scaled_silu"].handle)
