@@ -264,8 +264,11 @@ class PreparedMTP:
             return None
         if self.reductions:
             block = self.reductions[0](block)
-        residual, normalized = self.attn_hc.combine_norm_runtime(residual, block, injection)
-        mixed, injection = self.mlp_hc.mix_runtime(residual, normalized)
+        if getattr(self.attn_hc, "has_combine_mix", False):
+            residual, mixed, injection = self.attn_hc.combine_mix_runtime(residual, block, injection)
+        else:
+            residual, normalized = self.attn_hc.combine_norm_runtime(residual, block, injection)
+            mixed, injection = self.mlp_hc.mix_runtime(residual, normalized)
         block = self.moe(mixed)
         if self.reductions:
             block = self.reductions[1](block)

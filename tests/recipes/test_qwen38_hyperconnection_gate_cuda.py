@@ -667,3 +667,182 @@ def test_sm120_hyperconnection_triton_guards_reject_sm103_and_sm121(monkeypatch)
         assert supports_tiled_combine_down(4100, 4100, 320, down_w, device, following_fuses_scaled_silu=False) is expected
 
 
+def test_prepared_mtp_m1_combine_mix_compiled_parity(monkeypatch):
+    """M=1 PreparedMTP compiles and matches unfused combine_norm + mix_runtime under CUDA graph replay."""
+    from hyperflare_recipes.components.parallel import TensorParallelShard
+    from hyperflare_recipes.recipes.qwen38.attention import QSAMetadata, QSAState, RotaryTables
+    from hyperflare_recipes.recipes.qwen38.mtp import MTPScratch, PreparedMTP
+    from hyperflare_recipes.recipes.qwen38.mtp_weights import MTPWeights
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from tests.recipes.test_qwen38_pipelined_prefill_cuda import _make_mini_model_weights
+
+    device = torch.device("cuda:0")
+    shard = TensorParallelShard(0, 1)
+    mini = _make_mini_model_weights(device, shard, num_layers=4)
+    language = mini.tree.model.language_model
+    gen = torch.Generator(device="cpu").manual_seed(4242)
+    mtp_mod = torch.nn.Module()
+    mtp_mod.config = mini.tree.config.text_config
+    mtp_mod.fc_embedding = torch.nn.Linear(2560, 2560, bias=False).to(device=device, dtype=torch.bfloat16)
+    mtp_mod.fc_hidden = torch.nn.Linear(2560, 2560, bias=False).to(device=device, dtype=torch.bfloat16)
+    mtp_mod.pre_fc_norm_embedding = torch.nn.Module()
+    mtp_mod.pre_fc_norm_hidden = torch.nn.Module()
+    mtp_mod.fc_embedding.weight = torch.nn.Parameter(
+        (torch.randn((2560, 2560), generator=gen) * 0.02).bfloat16().to(device), requires_grad=False
+    )
+    mtp_mod.fc_hidden.weight = torch.nn.Parameter(
+        (torch.randn((2560, 2560), generator=gen) * 0.02).bfloat16().to(device), requires_grad=False
+    )
+    mtp_mod.pre_fc_norm_embedding.weight = torch.nn.Parameter(
+        (torch.randn((2560,), generator=gen) * 0.05).bfloat16().to(device), requires_grad=False
+    )
+    mtp_mod.pre_fc_norm_hidden.weight = torch.nn.Parameter(
+        (torch.randn((10240,), generator=gen) * 0.05).bfloat16().to(device), requires_grad=False
+    )
+    mtp_mod.hyper_connection_mixer = language.hyper_connection_mixer
+    mtp_mod.layers = torch.nn.ModuleList([language.layers[3]])
+    mtp_mod.eval().requires_grad_(False)
+    mtp_weights = MTPWeights(
+        module=mtp_mod,
+        attention=mini.layers[3].attention,
+        moe=mini.layers[3].moe,
+        embedding=language.embed_tokens.weight,
+        lm_head=mini.tree.lm_head.weight,
+        stored_bytes=0,
+        allocated_bytes=0,
+        shard=shard,
+        draft_head=None,
+    )
+
+    context, num_pages = 128, 2
+    rotary = RotaryTables.allocate(mtp_mod.config, context, device)
+    token_ids = torch.tensor([42], dtype=torch.int64, device=device)
+    target_hidden = (torch.randn((1, 10240), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    output_indices = torch.zeros(1, dtype=torch.int64, device=device)
+
+    def make_env():
+        scratch = MTPScratch.allocate(1, 1, device)
+        metadata = QSAMetadata.allocate(tokens=1, batch=1, context=context, device=device)
+        state = QSAState.allocate(pages=num_pages, slots=1, device=device, draft_tokens=7)
+        outputs = (
+            torch.empty_like(scratch.residual),
+            torch.empty_like(scratch.hidden),
+            torch.empty_like(scratch.logits),
+        )
+        return scratch, metadata, state, outputs
+
+    def reset_state(state):
+        for field in state.__dataclass_fields__:
+            value = getattr(state, field)
+            value.fill_(-1 if value.dtype == torch.int64 else 0)
+
+    def stage_metadata(metadata, *, active: bool):
+        metadata.main_block_table[0].copy_(torch.tensor([1, 0], device=device, dtype=torch.int32))
+        metadata.compressed_block_table.copy_(metadata.main_block_table)
+        metadata.raw_state_slot_ids.fill_(0)
+        metadata.request_ids.fill_(0 if active else -1)
+        metadata.query_positions.fill_(0 if active else -1)
+        metadata.rope_positions.fill_(0 if active else -1)
+        metadata.sequence_lengths.fill_(1 if active else 0)
+        metadata.query_start_loc.zero_()
+        metadata.query_start_loc[-1] = 1 if active else 0
+        metadata.num_accepted_tokens.fill_(1)
+        metadata.is_prefilling.fill_(False)
+        metadata.slot_mapping.fill_(64 if active else -1)
+
+    ref_scratch, ref_meta, ref_state, ref_out = make_env()
+    fused_scratch, fused_meta, fused_state, fused_out = make_env()
+    with torch.inference_mode(), RecordedPreparationSession(
+        device=device,
+        checkpoint="test_qwen38_mtp_m1_combine_mix",
+        workload_schema="test_qwen38_mtp_m1_combine_mix",
+        numerical_policy="default",
+        autotune_effort="off",
+    ) as session:
+        arena = ScratchArena(device, overlap=True)
+        session.register_scratch(arena)
+        monkeypatch.setattr(
+            "hyperflare_recipes.recipes.qwen38.hyperconnection.supports_m1_combine_mix",
+            lambda *args, **kwargs: False,
+        )
+        ref_op = PreparedMTP(
+            mtp_weights, ref_scratch, token_ids, target_hidden, ref_state, ref_meta, rotary, arena,
+            output_indices=output_indices, session=session, name="ref_mtp_m1", max_cache_pages=num_pages,
+        )
+        monkeypatch.undo()
+        fused_op = PreparedMTP(
+            mtp_weights, fused_scratch, token_ids, target_hidden, fused_state, fused_meta, rotary, arena,
+            output_indices=output_indices, session=session, name="fused_mtp_m1", max_cache_pages=num_pages,
+        )
+        ref_op.functional(session=session)
+        ref_op.release_outputs()
+        fused_op.functional(session=session)
+        fused_op.release_outputs()
+        session.tune(show_progress=False)
+
+        if torch.cuda.get_device_capability(device) == (12, 0):
+            assert "combine_norm" in ref_op.attn_hc.plans
+            assert not ref_op.attn_hc.has_combine_mix
+            assert fused_op.attn_hc.has_combine_mix
+            assert "combine_norm" not in fused_op.attn_hc.plans
+
+        def run_ref():
+            result = ref_op(token_ids, target_hidden, ref_meta, output_indices)
+            for dst, src in zip(ref_out, (result.residual, result.hidden, result.logits), strict=True):
+                dst.copy_(src)
+
+        def run_fused():
+            result = fused_op(token_ids, target_hidden, fused_meta, output_indices)
+            for dst, src in zip(fused_out, (result.residual, result.hidden, result.logits), strict=True):
+                dst.copy_(src)
+
+        ref_compiled = compile_forward(run_ref)
+        fused_compiled = compile_forward(run_fused)
+        stream = torch.cuda.Stream(device=device)
+        ref_graph = torch.cuda.CUDAGraph()
+        fused_graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(stream):
+                ref_compiled()
+                fused_compiled()
+            stream.synchronize()
+            with torch.cuda.graph(ref_graph, stream=stream):
+                ref_compiled()
+            with torch.cuda.graph(fused_graph, stream=stream):
+                fused_compiled()
+            stream.synchronize()
+
+            reset_state(ref_state)
+            reset_state(fused_state)
+            stage_metadata(ref_meta, active=True)
+            stage_metadata(fused_meta, active=True)
+            with torch.cuda.stream(stream):
+                ref_graph.replay()
+                fused_graph.replay()
+            stream.synchronize()
+
+            for actual, expected in zip(fused_out, ref_out, strict=True):
+                assert torch.isfinite(actual).all()
+                torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+            # Inactive replay must zero residual/hidden outputs and preserve cache state without allocations.
+            state_snap = {f: getattr(fused_state, f).clone() for f in fused_state.__dataclass_fields__}
+            stage_metadata(fused_meta, active=False)
+            torch.cuda.synchronize(device)
+            allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            with torch.cuda.stream(stream):
+                fused_graph.replay()
+            stream.synchronize()
+            assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+            assert torch.count_nonzero(fused_out[0]) == 0
+            assert torch.count_nonzero(fused_out[1]) == 0
+            for field, snap in state_snap.items():
+                assert torch.equal(getattr(fused_state, field), snap)
+        finally:
+            stream.synchronize()
+            ref_graph.reset()
+            fused_graph.reset()
+
+

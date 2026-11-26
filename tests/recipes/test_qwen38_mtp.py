@@ -188,6 +188,106 @@ def test_mtp_forward_preserves_feedback_alignment_and_all_streams(monkeypatch):
     assert operator.attention.state is replacement
 
 
+def test_mtp_forward_uses_fused_combine_mix_when_available(monkeypatch):
+    from hyperflare_recipes.components import embedding
+
+    scratch = mtp.MTPScratch.allocate(1, 1, "cpu")
+    ids = torch.tensor([8], dtype=torch.int64)
+    target = torch.arange(4, dtype=torch.bfloat16).view(1, 4, 1).expand(1, 4, 2560).reshape(1, 10240).contiguous()
+    metadata = SimpleNamespace(request_ids=torch.tensor([0]), rope_positions=torch.tensor([[3, 3, 3]]))
+    selected = torch.tensor([0], dtype=torch.int64)
+    plan = SimpleNamespace(request=lambda **kwargs: kwargs)
+    monkeypatch.setattr(embedding.embedding, "query_from_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(embedding.embedding, "plan", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(embedding.embedding, "run", lambda weight, ids, *, out, **kwargs: out.copy_(ids[:, None]))
+
+    class Embedding:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *, token_ids):
+            return token_ids[:, None].expand(-1, 2560).to(torch.bfloat16)
+
+    class Feedback:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, token, hidden):
+            return (hidden.view(-1, 4, 2560) + token[:, None]).flatten(1)
+
+    events = []
+
+    class HC:
+        def __init__(self, module, buffers, *, name, **kwargs):
+            self.name = name
+            self.has_combine_mix = False
+
+        def prepare_combine_norm(self, following, **kwargs):
+            self.has_combine_mix = True
+
+        def mix_runtime(self, source, normalized=None):
+            if self.name.endswith(".mlp_hc"):
+                pytest.fail("mlp_hc.mix_runtime must not run when attn_hc.has_combine_mix is true")
+            events.append((self.name, "mix"))
+            return source.view(-1, 4, 2560).mean(1), None
+
+        def combine_runtime(self, source, block, injection):
+            events.append((self.name, "combine"))
+            return (source.view(-1, 4, 2560) + block[:, None]).flatten(1)
+
+        def combine_norm_runtime(self, source, block, injection):
+            pytest.fail("combine_norm_runtime must not run when attn_hc.has_combine_mix is true")
+
+        def combine_mix_runtime(self, source, block, injection):
+            events.append((self.name, "combine_mix"))
+            combined = (source.view(-1, 4, 2560) + block[:, None]).flatten(1)
+            return combined, combined.view(-1, 4, 2560).mean(1), None
+
+    class Attention:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, source, meta):
+            return source * 2
+
+    class Moe:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, source):
+            return source * 3
+
+    class Head:
+        def __init__(self, source, weight, output, **kwargs):
+            self.width = output.shape[-1]
+
+        def __call__(self, source):
+            return source[:, :1].expand(-1, self.width)
+
+    for name, value in (("PreparedEmbedding", Embedding), ("PreparedMTPFeedback", Feedback), ("PreparedHyperconnection", HC),
+                        ("PreparedAttention", Attention), ("PreparedQwenMoe", Moe), ("UnquantizedProjection", Head)):
+        monkeypatch.setattr(mtp, name, value)
+    layer = SimpleNamespace(attn_hyper_connection=object(), mlp_hyper_connection=object(), self_attn=object())
+    weights = SimpleNamespace(module=SimpleNamespace(layers=[layer], hyper_connection_mixer=object()),
+                              attention={}, moe=object(), embedding=SimpleNamespace(device=torch.device("cpu")),
+                              lm_head=object(), draft_head=None)
+    operator = mtp.PreparedMTP(weights, scratch, ids, target, object(), metadata, object(),
+        ScratchArena("cpu"), output_indices=selected, session=SimpleNamespace(prepare=lambda _: None), name="draft")
+    out = operator(ids, target, metadata, selected)
+    expected = target.view(1, 4, 2560) + ids[:, None, None]
+    expected += 2 * expected.mean(1, keepdim=True)
+    expected += 3 * expected.mean(1, keepdim=True)
+    assert events == [
+        ("draft.attn_hc", "mix"),
+        ("draft.attn_hc", "combine_mix"),
+        ("draft.mlp_hc", "combine"),
+        ("draft.final_mixer", "mix"),
+    ]
+    assert torch.equal(out.residual, expected.flatten(1))
+    assert torch.equal(out.hidden, expected.mean(1))
+    assert torch.equal(out.logits, expected.mean(1)[selected, :1].expand_as(out.logits))
+
+
 def test_shared_bf16_expert_uses_bf16_projections_without_activation_quantization(monkeypatch):
     from hyperflare_recipes.components import mlp
 
