@@ -608,5 +608,104 @@ def test_packed_router_gate_moe_compiled_parity(tokens):
             assert torch.equal(n_strided, n_contig)
 
 
+@pytest.mark.parametrize(("tokens", "width"), [(512, 640), (512, 320), (300, 320), (512, 160)])
+def test_prepared_mlp_fused_swiglu_mxfp8_compiled_parity(tokens, width):
+    """Fused SwiGLU + zero-pad + MXFP8 quantize matches unfused b12x SwiGLU + MXFP8 down_proj bit-for-bit."""
+    from b12x.norm import hyperconnection
+    from b12x.preparation import PreparedCall
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession, declare
+    from hyperflare_recipes.components import sm103
+    from hyperflare_recipes.components.linear import QuantizedProjection
+    from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
+    from hyperflare_recipes.components.weights import MLPWeights, quantize_bf16_linear_as_mxfp8
+
+    device = torch.device("cuda:0")
+    if sm103.is_sm103(device):
+        pytest.skip("SM12x-only fused SwiGLU MXFP8 test")
+    hidden = 2560
+    gen = torch.Generator(device=device).manual_seed(91 + tokens + width)
+    w_gu = quantize_bf16_linear_as_mxfp8((torch.randn((2 * width, hidden), generator=gen, device=device) * 0.02).bfloat16())
+    w_down = quantize_bf16_linear_as_mxfp8((torch.randn((hidden, width), generator=gen, device=device) * 0.02).bfloat16())
+    weights = MLPWeights(w_gu, w_down)
+
+    source = (torch.randn((tokens, hidden), generator=gen, device=device) * 0.25).bfloat16()
+    source[-16:].zero_()  # Exercise inactive/zero rows alongside live rows.
+    scratch_fused = MLPScratch.allocate(tokens, hidden, width, device)
+    scratch_ref = MLPScratch.allocate(tokens, hidden, width, device)
+    out_buf = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=device)
+    ws = ScratchArena(device)
+    with RecordedPreparationSession(
+        device=device, checkpoint=f"test_swiglu_mx_{tokens}_{width}",
+        workload_schema=f"test_swiglu_mx_{tokens}_{width}",
+        numerical_policy="default", autotune_effort="off",
+    ) as session:
+        session.register_scratch(ws)
+        mlp_fused = PreparedMLP(
+            source, weights, scratch_fused.gate_up, scratch_fused.intermediate, scratch_fused.output,
+            session=session, name="fused", workspace=ws, activation_mode="auto",
+        )
+        assert mlp_fused.activation_plan is None and mlp_fused._down_encoded_bases is not None
+        ref_up = QuantizedProjection(
+            source, w_gu, scratch_ref.gate_up, session=session, name="ref.gate_up",
+            workspace=ws, activation_mode="auto",
+        )
+        ref_act = hyperconnection.plan(
+            hyperconnection.Caps(device=device, max_tokens=tokens, hidden_size=width),
+            invocation={"operation": "swiglu", "limit": float("inf"), "round_silu": True,
+                        "clamp_after_silu": False, "swiglu_alpha": 1.0, "swiglu_beta": 0.0},
+        )
+        declare(session, (ref_act.request(
+            name="ref.swiglu",
+            prepare_call=lambda st: PreparedCall(run=lambda: st.launch(scratch_ref.gate_up, scratch_ref.gate_up, scratch_ref.intermediate)),
+        ),))
+        ref_down = QuantizedProjection(
+            scratch_ref.intermediate, w_down, scratch_ref.output, session=session, name="ref.down",
+            workspace=ws, activation_mode="auto",
+        )
+        session.tune(show_progress=False)
+
+    # 1. Bound execution parity.
+    bound_fused = mlp_fused(source).clone()
+    ref_up(source)
+    hyperconnection.run_swiglu(scratch_ref.gate_up, limit=float("inf"), round_silu=True,
+                               out=scratch_ref.intermediate, plan=ref_act)
+    bound_ref = ref_down(scratch_ref.intermediate).clone()
+    assert torch.equal(bound_fused, bound_ref)
+    assert torch.equal(bound_fused[-16:], torch.zeros_like(bound_fused[-16:]))
+
+    # 2. Functional compiled CUDA graph execution parity.
+    ws_fn = ScratchArena(device)
+    with RecordedPreparationSession(
+        device=device, checkpoint=f"test_swiglu_mx_fn_{tokens}_{width}",
+        workload_schema=f"test_swiglu_mx_fn_{tokens}_{width}",
+        numerical_policy="default", autotune_effort="off",
+    ) as session:
+        session.register_scratch(ws_fn)
+        mlp_fn = PreparedMLP(
+            source, weights, MLPScratch.allocate(tokens, hidden, width, device).gate_up,
+            MLPScratch.allocate(tokens, hidden, width, device).intermediate,
+            MLPScratch.allocate(tokens, hidden, width, device).output,
+            session=session, name="fused_fn", workspace=ws_fn, activation_mode="auto",
+        ).functional(session=session)
+        session.tune(show_progress=False)
+
+    def run():
+        out_buf.copy_(mlp_fn(source))
+
+    compiled = compile_forward(run)
+    compiled()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    out_buf.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    graph.reset()
+    assert torch.equal(out_buf, bound_ref)
+
+
 
 
