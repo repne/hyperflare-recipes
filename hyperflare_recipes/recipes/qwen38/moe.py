@@ -118,7 +118,8 @@ class PreparedSharedExpert(PreparedMLP):
     """MXFP8 or stored BF16 SwiGLU with BF16 SiLU and sigmoid boundaries."""
 
     def __init__(self, source, weights: SharedExpertWeights, *, session: PreparationSession, name: str,
-                 scratch: SharedExpertScratch | None = None, projection_workspace: ScratchArena | torch.Tensor | None = None):
+                 scratch: SharedExpertScratch | None = None, projection_workspace: ScratchArena | torch.Tensor | None = None,
+                 gate_source: torch.Tensor | None = None):
         if source.ndim != 2 or source.shape[1] != 2560 or source.dtype != torch.bfloat16:
             raise ValueError("shared expert input must be BF16 [tokens, 2560]")
         def geometry(weight):
@@ -143,7 +144,10 @@ class PreparedSharedExpert(PreparedMLP):
             self.intermediate, self.projected, session=session, name=name,
             workspace=projection_workspace, activation_mode="auto")
         self.output = scratch.output
-        self.gate_projection = UnquantizedProjection(source, weights.gate, self.gate_logits,
+        gate_input = source if gate_source is None else gate_source
+        if gate_input.ndim != 2 or gate_input.shape[1] != 2560 or gate_input.dtype != torch.bfloat16 or gate_input.shape[0] > tokens:
+            raise ValueError("shared expert gate input must be BF16 [<=tokens, 2560]")
+        self.gate_projection = UnquantizedProjection(gate_input, weights.gate, self.gate_logits[:gate_input.shape[0]],
             session=session, name=f"{name}.shared_gate")
 
     def functional(self, *, session):
@@ -151,6 +155,9 @@ class PreparedSharedExpert(PreparedMLP):
         self.gate_projection.functional(session=session)
         self.scratch = self.gate_logits = self.projected = None
         return self
+
+    def project_mlp_runtime(self, source):
+        return super().__call__(source)
 
     def project_runtime(self, source):
         return super().__call__(source), self.gate_projection(source)
@@ -171,7 +178,8 @@ class PreparedQwenMoe:
 
     def __init__(self, source, weights: QwenMoeWeights, *, session: PreparationSession, name: str,
                  scratch: QwenMoeScratch | None = None, workspace: ScratchArena | torch.Tensor | None = None,
-                 projection_workspace: ScratchArena | torch.Tensor | None = None, prefill: bool = False):
+                 projection_workspace: ScratchArena | torch.Tensor | None = None, prefill: bool = False,
+                 shard_source: torch.Tensor | None = None):
         if (weights.experts.num_experts, weights.experts.hidden_size) != (512, 2560):
             raise ValueError("Qwen MoE requires all 512 experts with hidden size 2560")
         if tuple(weights.router.shape) != (512, 2560):
@@ -186,17 +194,22 @@ class PreparedQwenMoe:
         self.scratch = scratch
         self.router_logits, self.router = scratch.router_logits, scratch.router
         self.routed_output, self.output = scratch.routed_output, scratch.output
-        self.router_projection = UnquantizedProjection(source, weights.router, self.router_logits,
+        route_in = source if shard_source is None else shard_source
+        if route_in.ndim != 2 or route_in.shape[1] != 2560 or route_in.dtype != torch.bfloat16 or route_in.shape[0] > source.shape[0]:
+            raise ValueError("Qwen MoE shard source must be BF16 [<=tokens, 2560]")
+        route_tokens = route_in.shape[0]
+        self.router_projection = UnquantizedProjection(route_in, weights.router, self.router_logits[:route_tokens],
             session=session, name=f"{name}.router")
-        self.routing = PreparedRouter(self.router_logits, self.router, session=session, name=f"{name}.route_topk")
+        self.routing = PreparedRouter(self.router_logits[:route_tokens], self.router.rows(route_tokens),
+            session=session, name=f"{name}.route_topk")
         self.shared = PreparedSharedExpert(source, weights.shared, session=session, name=f"{name}.shared",
-            scratch=scratch.shared, projection_workspace=projection_workspace)
+            scratch=scratch.shared, projection_workspace=projection_workspace, gate_source=shard_source)
         self.experts = PreparedRoutedExperts(source, weights.experts, self.router.ids,
             self.router.weights, self.routed_output, session=session, name=f"{name}.experts", workspace=workspace,
             router_plan=self.routing.plan, a4_prefill=prefill and weights.experts_a4_prefill)
         self.concurrent_shared = None
-        if (source.shape[0] <= 256 and isinstance(workspace, ScratchArena) and workspace is projection_workspace
-                and workspace.overlap):
+        if (shard_source is None and source.shape[0] <= 256 and isinstance(workspace, ScratchArena)
+                and workspace is projection_workspace and workspace.overlap):
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.router_projection.plan, self.routing.plan, self.experts.plan),
                 gate_projection=self.shared.gate_projection, session=session, workspace=workspace)
@@ -218,6 +231,22 @@ class PreparedQwenMoe:
         self.source = self.scratch = self.router_logits = self.router = None
         self.routed_output = self.output = None
         return self
+
+    def route_shard_runtime(self, shard_source: torch.Tensor):
+        logits = self.router_projection(shard_source)
+        routes = self.routing(logits)
+        gate = self.shared.gate_projection(shard_source)
+        return routes.ids, routes.weights, gate
+
+    def run_gathered_runtime(self, source: torch.Tensor, route_ids: torch.Tensor,
+                             route_weights: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        projected = self.shared.project_mlp_runtime(source)
+        if getattr(self.experts, "reduces_into_shared", False):
+            staged = self.experts.stage_rows(source, route_ids, route_weights)
+            shared = self.shared.finish_runtime(projected, gate)
+            return self.experts.reduce(shared, staged=staged)
+        routed = self.experts(source, route_ids, route_weights)
+        return self.shared.finish_runtime(projected, gate, routed)
 
     def _functional(self, source):
         if self.concurrent_shared is None:

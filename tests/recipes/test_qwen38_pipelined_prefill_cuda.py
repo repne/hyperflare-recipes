@@ -287,7 +287,12 @@ def _make_mini_model_weights(device: torch.device, shard, num_layers: int = 5):
             )
             attention = {
                 "in_proj_qkvz": _make_mxfp8_weight(16384 // world, 2560, device, g_layer),
-                "in_proj_ba": (torch.randn((96 // world, 2560), generator=g_layer) * 0.02).bfloat16().to(device),
+                # Exercise both checkpoint-style MXFP8 in_proj_ba (layer 2) and BF16 fallback (layers 0, 1, 4).
+                "in_proj_ba": (
+                    _make_mxfp8_weight(96 // world, 2560, device, g_layer)
+                    if idx == 2
+                    else (torch.randn((96 // world, 2560), generator=g_layer) * 0.02).bfloat16().to(device)
+                ),
                 "out_proj": _make_mxfp8_weight(2560, 6144 // world, device, g_layer),
             }
         moe_weights = _make_nvfp4_moe_weights(device, world, seed=500 + idx * 31, rank=shard.rank)
@@ -509,6 +514,8 @@ def _tp2_pipelined_prefill_worker(rank: int, world: int, port: int, tokens: int,
             qsa_gather_runtime=qsa_gather_rt, qsa_shard_mode="row", coordinator=coordinator,
         )
         assert pipe_decoder.pipelined_prefill is True
+        assert pipe_decoder.row_shard_dma is True
+        assert pipe_decoder.layer_attn_mxfp8 == (False, False, True, True, False)
         s = pipe_decoder.state
         pipe_decoder.capture_context(
             SimpleNamespace(
