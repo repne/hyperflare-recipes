@@ -165,3 +165,68 @@ def test_prepared_hyperconnection_mix_runtime_compiled_parity(rows: int, has_inj
         torch.testing.assert_close(out_buf, expected_mixed, rtol=2e-2, atol=2e-2)
         if has_injection:
             torch.testing.assert_close(inj_buf, expected_inj, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("rows", [1024, 2048, 4096])
+@pytest.mark.parametrize("fuse_mlp", [False, True])
+def test_triton_combine_norm_compiled_parity(rows: int, fuse_mlp: bool):
+    from b12x.norm.hyperconnection import reference
+    from ignition.preparation.aot import aot_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from hyperflare_recipes.recipes.qwen38.hyperconnection import (
+        HyperconnectionScratch,
+        PreparedHyperconnection,
+    )
+
+    device = torch.device("cuda:0")
+    first_mod = _make_hc_module(device, has_injection=True, seed=4000 + rows)
+    next_mod = _make_hc_module(device, has_injection=True, seed=5000 + rows)
+    gen = torch.Generator(device="cpu").manual_seed(6000 + rows + int(fuse_mlp))
+    residual = (torch.randn((rows, 10240), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    routed = (torch.randn((rows, 2560), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    shared = (torch.randn((rows, 2560), generator=gen) * 0.25).bfloat16().to(device).contiguous()
+    sgate = (torch.randn((rows, 1), generator=gen) * 0.5).bfloat16().to(device).contiguous()
+    inj = (torch.randn((rows, 336), generator=gen) * 0.5).bfloat16().to(device)[:, 320:324]
+
+    block_ref = routed + shared * torch.sigmoid(sgate) if fuse_mlp else routed
+    expected_comb = reference.combine(residual, block_ref, inj, streams=4)
+    expected_norm = reference.grouped_rmsnorm(expected_comb, next_mod.hc_norm.weight, streams=4, eps=1e-6)
+
+    with torch.inference_mode(), RecordedPreparationSession(
+        device=device,
+        checkpoint=f"test-cn-{rows}-{int(fuse_mlp)}",
+        workload_schema="test-cn",
+        numerical_policy="bf16",
+        autotune_effort="off",
+    ) as session:
+        scratch = HyperconnectionScratch.allocate(rows, device)
+        priming = torch.zeros_like(scratch.normalized)
+        first = PreparedHyperconnection(first_mod, scratch, priming_state=priming, session=session, name="first")
+        following = PreparedHyperconnection(next_mod, scratch, priming_state=priming, session=session, name="next")
+        first.prepare_combine_norm(following, priming_state=priming, session=session, name="cn", fuse_mlp=fuse_mlp)
+        first.functional(session=session)
+        following.functional(session=session)
+        session.tune(show_progress=False)
+
+        if torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)):
+            if fuse_mlp:
+                assert first._triton_combine_norm_mlp is not None
+            else:
+                assert first._triton_combine_norm is not None
+
+        comb_buf = torch.empty_like(residual)
+        norm_buf = torch.empty_like(residual)
+
+        def run():
+            if fuse_mlp:
+                c, n = first.combine_norm_mlp_runtime(residual, routed, shared, sgate, inj)
+            else:
+                c, n = first.combine_norm_runtime(residual, routed, inj)
+            comb_buf.copy_(c)
+            norm_buf.copy_(n)
+
+        compiled = aot_forward(run)
+        compiled(run)
+        torch.testing.assert_close(comb_buf, expected_comb, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(norm_buf, expected_norm, rtol=2e-2, atol=2e-2)
+

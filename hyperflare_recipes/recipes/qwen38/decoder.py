@@ -784,7 +784,7 @@ class PreparedDecoder:
                     row_in, row_out, runtime=row_rt, session=session,
                     coordinator=coordinator, name=f"{name}.final_row_reduce",
                 )
-        for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
+        for index, (attn_hc, _, mlp_hc, moe) in enumerate(self.layers):
             if mlp_hc is None:
                 continue
             hc_scratch = shard_scratch if (self.row_shard_dma and index >= 1) else layer_scratch
@@ -792,22 +792,30 @@ class PreparedDecoder:
                 session=session, name=f"{name}.layer{index}.attn_combine_norm")
             if index != 0 and ((self.sample and not self._single_row_final_mixer) or index + 1 < len(self.layers)):
                 following = self.layers[index + 1][0] if index + 1 < len(self.layers) else self.final_mixer
+                fuse_mlp = (
+                    not self.row_shard_dma
+                    and not self.pipelined_prefill
+                    and not self.reductions
+                    and moe is not None
+                    and not getattr(getattr(moe, "experts", None), "reduces_into_shared", False)
+                )
                 mlp_hc.prepare_combine_norm(following, priming_state=hc_scratch.residual,
-                    session=session, name=f"{name}.layer{index}.mlp_combine_norm")
+                    session=session, name=f"{name}.layer{index}.mlp_combine_norm", fuse_mlp=fuse_mlp)
         if self.row_shard_dma:
             for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
                 if index == 0:
                     _, cr_att_1, cr_mlp_0, _ = self.pipelined_reductions[0]
-                    if mlp_hc is not None:
+                    if mlp_hc is not None and "combine_norm" in attn_hc.plans:
                         attn_cn = attn_hc.plans["combine_norm"]
                         workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
                         workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
                     continue
                 (cr_ag_0, _, _, _, cr_ffn_0, cr_ffn_1, cr_mlp_0, cr_mlp_1) = self.pipelined_reductions[index]
                 if mlp_hc is not None:
-                    attn_cn = attn_hc.plans["combine_norm"]
-                    workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
-                    workspaces.register_parallel(cr_ffn_0.gather.plan, attn_cn)
+                    if "combine_norm" in attn_hc.plans:
+                        attn_cn = attn_hc.plans["combine_norm"]
+                        workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
+                        workspaces.register_parallel(cr_ffn_0.gather.plan, attn_cn)
                     if "combine_norm" in mlp_hc.plans:
                         workspaces.register_parallel(cr_ffn_1.gather.plan, mlp_hc.plans["combine_norm"])
                         workspaces.register_parallel(cr_mlp_1.reduce.plan, mlp_hc.plans["combine_norm"])
@@ -828,15 +836,16 @@ class PreparedDecoder:
             for index, (attn_hc, attention, mlp_hc, _) in enumerate(self.layers):
                 cr_att_0, cr_att_1, cr_mlp_0, cr_mlp_1 = self.pipelined_reductions[index]
                 if mlp_hc is not None:
-                    attn_cn = attn_hc.plans["combine_norm"]
-                    workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
-                    workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
+                    if "combine_norm" in attn_hc.plans:
+                        attn_cn = attn_hc.plans["combine_norm"]
+                        workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
+                        workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
                     if index > 0 and "combine_norm" in mlp_hc.plans:
                         workspaces.register_parallel(cr_mlp_1.reduce.plan, mlp_hc.plans["combine_norm"])
                 if index >= 2:
                     prev_cr_mlp_1 = self.pipelined_reductions[index - 1][3]
-                    prev_mlp_cn = self.layers[index - 1][2].plans["combine_norm"]
-                    if cr_att_0 is not None:
+                    prev_mlp_cn = self.layers[index - 1][2].plans.get("combine_norm")
+                    if cr_att_0 is not None and prev_mlp_cn is not None:
                         workspaces.register_parallel(cr_att_0.reduce.plan, prev_mlp_cn)
                     for plan in _hc_plans(attn_hc) + _attention_plans(attention, is_qsa=index % 4 == 3):
                         workspaces.register_parallel(prev_cr_mlp_1.reduce.plan, plan)
@@ -1511,13 +1520,21 @@ class PreparedDecoder:
                     block = self.reductions[index][0](block)
                 residual, normalized = attn_hc.combine_norm_runtime(residual, block, injection)
                 mixed, injection = mlp_hc.mix_runtime(residual, normalized)
-                block = moe(mixed)
-                if self.reductions:
-                    block = self.reductions[index][1](block)
                 if index == 0 or ((not self.sample or self._single_row_final_mixer) and index + 1 == len(self.layers)):
+                    block = moe(mixed)
+                    if self.reductions:
+                        block = self.reductions[index][1](block)
                     residual = mlp_hc.combine_runtime(residual, block, injection)
                     normalized = None
+                elif not self.reductions and getattr(mlp_hc, "_triton_combine_norm_mlp", None) is not None:
+                    routed, shared_proj, shared_gate = moe.parts_runtime(mixed)
+                    residual, normalized = mlp_hc.combine_norm_mlp_runtime(
+                        residual, routed, shared_proj, shared_gate, injection,
+                    )
                 else:
+                    block = moe(mixed)
+                    if self.reductions:
+                        block = self.reductions[index][1](block)
                     residual, normalized = mlp_hc.combine_norm_runtime(residual, block, injection)
                 if self.layer_outputs is not None:
                     self.layer_outputs[index].copy_(residual)

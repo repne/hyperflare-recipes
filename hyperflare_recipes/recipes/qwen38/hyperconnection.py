@@ -13,6 +13,11 @@ import torch
 from b12x.norm.hyperconnection import api as hc
 from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 
+from hyperflare_recipes.components.hyperconnection_combine import (
+    launch_combine_norm,
+    supports_triton_combine_norm,
+    warmup_combine_norm,
+)
 from hyperflare_recipes.components.hyperconnection_gate import PreparedHyperconnectionGate, PreparedShardedHyperconnectionGate
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.fixtures import hyperconnection as hc_fixtures
@@ -203,11 +208,38 @@ class PreparedHyperconnection:
 
     def prepare_combine_norm(self, following: PreparedHyperconnection, *,
                              priming_state: torch.Tensor, session: PreparationSession,
-                             name: str) -> None:
+                             name: str, fuse_mlp: bool = False) -> None:
         if self.injection is None:
             raise ValueError("the final hyperconnection mixer has no residual injection")
         self.following = following
-        caps = hc.Caps(device=self.scratch.normalized.device, max_tokens=self.tokens,
+        device = self.scratch.normalized.device
+        self._triton_combine_norm = None
+        self._triton_combine_norm_mlp = None
+        if supports_triton_combine_norm(self.tokens, device):
+            if fuse_mlp:
+                self._triton_combine_norm_mlp = warmup_combine_norm(
+                    priming_state,
+                    self.scratch.block_input,
+                    self.scratch.injection_logits,
+                    following.norm_gain,
+                    self.scratch.gate_workspace,
+                    following.scratch.normalized[:self.tokens],
+                    eps=following.eps,
+                    fuse_mlp=True,
+                )
+            else:
+                self._triton_combine_norm = warmup_combine_norm(
+                    priming_state,
+                    self.scratch.block_input,
+                    self.scratch.injection_logits,
+                    following.norm_gain,
+                    self.scratch.gate_workspace,
+                    following.scratch.normalized[:self.tokens],
+                    eps=following.eps,
+                    fuse_mlp=False,
+                )
+            return
+        caps = hc.Caps(device=device, max_tokens=self.tokens,
                        hidden_size=2560, streams=4, lowrank=self.lowrank)
         plan = hc.plan(caps, invocation=FrozenMapping({"operation": "combine_norm",
             "eps": following.eps, "zero_centered": False, "weight_dtype": "float32",
@@ -253,8 +285,23 @@ class PreparedHyperconnection:
         return hc.run_combine(residual, block_output, injection, plan=self.plans["combine"], out=combined)
 
     def combine_norm_runtime(self, residual, block_output, injection):
+        triton_cn = getattr(self, "_triton_combine_norm", None)
+        if triton_cn is not None:
+            grid, options = triton_cn
+            return launch_combine_norm(
+                residual, block_output, injection, self.following.norm_gain,
+                grid=grid, options=options,
+            )
         combined = torch.empty_like(residual)
         normalized = torch.empty_like(residual)
         return hc.run_combine_norm(residual, block_output, injection, self.following.norm_gain,
             eps=self.following.eps, zero_centered=False, plan=self.plans["combine_norm"],
             out=(combined, normalized))
+
+    def combine_norm_mlp_runtime(self, residual, routed, shared_projected, shared_gate, injection):
+        grid, options = self._triton_combine_norm_mlp
+        return launch_combine_norm(
+            residual, routed, injection, self.following.norm_gain,
+            grid=grid, options=options,
+            shared_projected=shared_projected, shared_gate=shared_gate,
+        )

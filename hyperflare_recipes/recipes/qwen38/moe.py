@@ -248,6 +248,22 @@ class PreparedQwenMoe:
         routed = self.experts(source, route_ids, route_weights)
         return self.shared.finish_runtime(projected, gate, routed)
 
+    def parts_runtime(self, source: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(routed, shared_projected, shared_gate)`` before gated addition."""
+        if getattr(self.experts, "reduces_into_shared", False):
+            raise ValueError("parts_runtime requires separate routed and shared expert outputs")
+        if self.concurrent_shared is None:
+            projected, gate = self.shared.project_runtime(source)
+        else:
+            pending = self.concurrent_shared.start(source)
+        logits = self.router_projection(source)
+        routes = self.routing(logits)
+        routed = self.experts(source, routes.ids, routes.weights)
+        if self.concurrent_shared is not None:
+            projected = self.concurrent_shared.finish(pending, routed)
+            gate = pending.gate
+        return routed, projected, gate
+
     def _functional(self, source):
         if self.concurrent_shared is None:
             projected, gate = self.shared.project_runtime(source)
