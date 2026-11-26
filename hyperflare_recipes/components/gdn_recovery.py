@@ -39,6 +39,18 @@ ROWS = 16
 # rides on the kernels so whole-forward compilation, which drops launch keywords, keeps it.
 _CONFIG = triton.Config({}, num_warps=1, num_stages=2)
 _CONV_CONFIG = triton.Config({}, num_warps=4, num_stages=2)
+_WY_CONFIG = triton.Config({}, num_warps=4, num_stages=2)
+_COMMIT_STREAM_CONFIG = triton.Config({}, num_warps=4, num_stages=2)
+_WY_ROWS = 64
+_WY_BK = 16
+_WY_MIN_HEADS = 96
+_COMMIT_STREAM_ROWS = 32
+# Switch commit to streaming evict-first stores once the committed working set exceeds L2.
+_COMMIT_STREAM_MIN_BYTES = 192 << 20
+
+
+def _is_sm12x(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 12
 
 
 @triton.autotune(configs=[_CONFIG], key=[])
@@ -194,6 +206,90 @@ def _verify(Mixed, A, B, ALog, DtBias, State, Starts, Slots, NumSeqs, Output, De
                 tl.store(State + offsets, state)
 
 
+@triton.autotune(configs=[_WY_CONFIG], key=[])
+@triton.jit
+def _verify_wy(
+    Mixed, State, Starts, Slots, NumSeqs, Output, Delta, Keys, Decay, Queries, Beta,
+    mixed_stride, state_stride, slot_stride,
+    KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr,
+    WINDOW: tl.constexpr, RECORD_WIDTH: tl.constexpr,
+    ROWS: tl.constexpr, BK: tl.constexpr, EVICT_STATE: tl.constexpr,
+):
+    # Non-in-place WY verification for 2 <= WINDOW <= 8: stream S_0 once through
+    # tf32x3 tensor-core dots to form S_0 [K^T, Q^T] and the [K, Q] Gram matrix,
+    # then run the W-step delta-rule recurrence on the [ROWS, 8] history without
+    # materializing intermediate [ROWS, 128] state updates.
+    tile, request_head = tl.program_id(0), tl.program_id(1)
+    request = request_head // VALUE_HEADS
+    head = request_head % VALUE_HEADS
+    key_head = head // (VALUE_HEADS // KEY_HEADS)
+    if request < tl.load(NumSeqs):
+        start = tl.load(Starts + request)
+        length = tl.load(Starts + request + 1) - start
+        slot = tl.load(Slots + request * slot_stride).to(tl.int64)
+        rows = tile * ROWS + tl.arange(0, ROWS)
+        if slot == 0:
+            for position in tl.static_range(WINDOW):
+                if position < length:
+                    token = (start + position).to(tl.int64)
+                    tl.store(Output + token * (VALUE_HEADS * 128) + head * 128 + rows,
+                             tl.zeros((ROWS,), tl.bfloat16))
+        elif length > 0:
+            rk = request * KEY_HEADS + key_head
+            rh = request * VALUE_HEADS + head
+            w = tl.arange(0, 8)
+            live_w = (w < length) & (w < WINDOW)
+            s_base = slot * state_stride + head * (128 * 128) + rows[:, None] * 128
+            acc = tl.zeros((ROWS, 16), dtype=tl.float32)
+            gram = tl.zeros((16, 16), dtype=tl.float32)
+            for k0 in tl.static_range(0, 128, BK):
+                kk = k0 + tl.arange(0, BK)
+                if EVICT_STATE:
+                    s_blk = tl.load(State + s_base + kk[None, :], eviction_policy="evict_first")
+                else:
+                    s_blk = tl.load(State + s_base + kk[None, :])
+                k_raw = tl.load(Keys + (rk * RECORD_WIDTH + w[:, None]) * 128 + kk[None, :],
+                                mask=live_w[:, None], other=0.0)
+                q_raw = tl.load(Queries + (rk * WINDOW + w[:, None]) * 128 + kk[None, :],
+                                mask=live_w[:, None], other=0.0)
+                kq_blk = tl.reshape(tl.join(tl.trans(k_raw), tl.trans(q_raw)), (BK, 16))
+                acc = tl.dot(s_blk, kq_blk, acc=acc, input_precision="tf32x3")
+                gram = tl.dot(tl.trans(kq_blk), kq_blk, acc=gram, input_precision="tf32x3")
+
+            sk0, sq0 = tl.split(tl.reshape(acc, (ROWS, 8, 2)))
+            gram_kcols, _ = tl.split(tl.reshape(gram, (16, 8, 2)))
+            kk_t, qk_t = tl.split(tl.reshape(tl.trans(gram_kcols), (8, 8, 2)))
+            kk_gram = tl.trans(kk_t)
+            qk_gram = tl.trans(qk_t)
+
+            d_base = rh * RECORD_WIDTH
+            b_base = rh * WINDOW
+            total_decay = 1.0
+            hist = tl.zeros((ROWS, 8), dtype=tl.float32)
+            for position in tl.static_range(WINDOW):
+                if position < length:
+                    token = (start + position).to(tl.int64)
+                    decay_t = tl.load(Decay + d_base + position)
+                    beta_t = tl.load(Beta + b_base + position).to(tl.float32)
+                    val_t = tl.load(
+                        Mixed + token * mixed_stride + 2 * KEY_HEADS * 128 + head * 128 + rows
+                    ).to(tl.float32)
+                    total_decay = total_decay * decay_t
+                    hist = hist * decay_t
+                    sel = w == position
+                    sk0_t = tl.sum(tl.where(sel[None, :], sk0, 0.0), axis=1)
+                    sq0_t = tl.sum(tl.where(sel[None, :], sq0, 0.0), axis=1)
+                    kk_row = tl.sum(tl.where(sel[:, None], kk_gram, 0.0), axis=0)
+                    qk_row = tl.sum(tl.where(sel[:, None], qk_gram, 0.0), axis=0)
+                    qk_tt = tl.sum(tl.where(sel, qk_row, 0.0), axis=0)
+                    pred_k = total_decay * sk0_t + tl.sum(hist * kk_row[None, :], axis=1)
+                    delta_t = (val_t - pred_k) * beta_t
+                    out_t = total_decay * sq0_t + tl.sum(hist * qk_row[None, :], axis=1) + qk_tt * delta_t
+                    tl.store(Output + token * (VALUE_HEADS * 128) + head * 128 + rows, out_t.to(tl.bfloat16))
+                    tl.store(Delta + (d_base + position) * 128 + rows, delta_t)
+                    hist = tl.where(sel[None, :], delta_t[:, None], hist)
+
+
 @triton.autotune(configs=[_CONFIG], key=[])
 @triton.jit
 def _commit(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeqs, state_stride, slot_stride,
@@ -224,6 +320,45 @@ def _commit(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeq
                     state = state * decay
                     state = state + delta[:, None] * k[None, :]
             tl.store(State + offsets, state)
+
+
+@triton.autotune(configs=[_COMMIT_STREAM_CONFIG], key=[])
+@triton.jit
+def _commit_streaming(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeqs, state_stride, slot_stride,
+                      ROWS_CAPACITY: tl.constexpr, KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr,
+                      WINDOW: tl.constexpr, RECORD_WIDTH: tl.constexpr, ROWS: tl.constexpr,
+                      STATE_ALIGNMENT: tl.constexpr):
+    # Large-batch commit exceeds L2: schedule requests on grid-z, evict state tiles
+    # first, and scale state once before accumulating accepted updates in reverse
+    # suffix-decay order.
+    tile, layer_head, request = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    layer = layer_head // VALUE_HEADS
+    head = layer_head % VALUE_HEADS
+    key_head = head // (VALUE_HEADS // KEY_HEADS)
+    if request < tl.load(NumSeqs):
+        slot = tl.load(Slots + request * slot_stride).to(tl.int64)
+        count = tl.load(Counts + request)
+        if (slot != 0) & (count > 0):
+            rows = tile * ROWS + tl.arange(0, ROWS)
+            keys = tl.arange(0, 128)
+            base = tl.multiple_of(tl.load(LayerOffsets + layer) + slot * state_stride, STATE_ALIGNMENT)
+            offsets = base + head * (128 * 128) + rows[:, None] * 128 + keys[None, :]
+            owner = layer * ROWS_CAPACITY + request
+            total_decay = 1.0
+            for position in tl.static_range(WINDOW):
+                if position < count:
+                    total_decay = total_decay * tl.load(Decay + (owner * VALUE_HEADS + head) * RECORD_WIDTH + position)
+            state = tl.load(State + offsets, eviction_policy="evict_first") * total_decay
+            suffix = 1.0
+            for rev in tl.static_range(WINDOW):
+                position = WINDOW - 1 - rev
+                if position < count:
+                    k = tl.load(KeyRecords + ((owner * KEY_HEADS + key_head) * RECORD_WIDTH + position) * 128 + keys)
+                    delta = tl.load(Delta + ((owner * VALUE_HEADS + head) * RECORD_WIDTH + position) * 128 + rows)
+                    decay = tl.load(Decay + (owner * VALUE_HEADS + head) * RECORD_WIDTH + position)
+                    state = state + (delta * suffix)[:, None] * k[None, :]
+                    suffix = suffix * decay
+            tl.store(State + offsets, state, eviction_policy="evict_first")
 
 
 @dataclass(frozen=True)
@@ -360,25 +495,52 @@ class PreparedRecoveredRecurrence:
             self.prepare_compiled = warmup_triton(prepare_kernel.fn, self.prepare_args, self.prepare_grid,
                                                 num_warps=prepare_config.num_warps, num_stages=prepare_config.num_stages,
                                                 **self.prepare_options)
-        self.args = (mixed_qkv, a, b, A_log, dt_bias, state, metadata.query_start_loc, slots, metadata.num_seqs,
-                     output, delta, keys, decay, queries, beta, mixed_qkv.stride(0), a.stride(0),
-                     b.stride(0), state.stride(0), metadata.state_indices.stride(0))
-        verify_rows = 8 if precomputed or sequences * value_heads >= 192 else 4
-        self.options = {"KEY_HEADS": key_heads, "VALUE_HEADS": value_heads, "SCALE": 1.0 / math.sqrt(128),
-                        "WINDOW": width, "RECORD_WIDTH": record_width, "ROWS": verify_rows, "IN_PLACE": records is None, "PRECOMPUTED": precomputed}
-        self.grid = (128 // verify_rows, sequences * value_heads, 1)
-        self.compiled = warmup_triton(_verify.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
-                                      num_stages=_CONFIG.num_stages, **self.options)
+        use_wy = (
+            precomputed
+            and records is not None
+            and 2 <= width <= 8
+            and sequences * value_heads >= _WY_MIN_HEADS
+            and _is_sm12x(state.device)
+        )
+        self.use_wy = use_wy
+        if use_wy:
+            self.args = (mixed_qkv, state, metadata.query_start_loc, slots, metadata.num_seqs,
+                         output, delta, keys, decay, queries, beta, mixed_qkv.stride(0),
+                         state.stride(0), metadata.state_indices.stride(0))
+            self.options = {"KEY_HEADS": key_heads, "VALUE_HEADS": value_heads,
+                            "WINDOW": width, "RECORD_WIDTH": record_width,
+                            "ROWS": _WY_ROWS, "BK": _WY_BK, "EVICT_STATE": True}
+            self.grid = (128 // _WY_ROWS, sequences * value_heads, 1)
+            self.compiled = warmup_triton(_verify_wy.fn, self.args, self.grid, num_warps=_WY_CONFIG.num_warps,
+                                          num_stages=_WY_CONFIG.num_stages, **self.options)
+        else:
+            self.args = (mixed_qkv, a, b, A_log, dt_bias, state, metadata.query_start_loc, slots, metadata.num_seqs,
+                         output, delta, keys, decay, queries, beta, mixed_qkv.stride(0), a.stride(0),
+                         b.stride(0), state.stride(0), metadata.state_indices.stride(0))
+            verify_rows = 8 if precomputed or sequences * value_heads >= 192 else 4
+            self.options = {"KEY_HEADS": key_heads, "VALUE_HEADS": value_heads, "SCALE": 1.0 / math.sqrt(128),
+                            "WINDOW": width, "RECORD_WIDTH": record_width, "ROWS": verify_rows,
+                            "IN_PLACE": records is None, "PRECOMPUTED": precomputed}
+            self.grid = (128 // verify_rows, sequences * value_heads, 1)
+            self.compiled = warmup_triton(_verify.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
+                                          num_stages=_CONFIG.num_stages, **self.options)
 
     def functional(self, *, dynamic_metadata=False):
         """Receive correction records from the enclosing round instead of retaining them."""
         if self.args is None:
             return self
-        (mixed, a, b, A_log, dt_bias, state, starts, slots, num_seqs,
-         output, delta, keys, decay, queries, beta, _, _, _, state_stride, slot_stride) = self.args
+        if getattr(self, "use_wy", False):
+            (mixed, state, starts, slots, num_seqs, output, delta, keys, decay, queries, beta,
+             _, state_stride, slot_stride) = self.args
+            A_log, dt_bias = self.prepare_args[3], self.prepare_args[4]
+            in_place = False
+        else:
+            (mixed, a, b, A_log, dt_bias, state, starts, slots, num_seqs,
+             output, delta, keys, decay, queries, beta, _, _, _, state_stride, slot_stride) = self.args
+            in_place = self.options["IN_PLACE"]
         self.persistent = (A_log, dt_bias, state, None if dynamic_metadata else starts,
                            None if dynamic_metadata else slots, None if dynamic_metadata else num_seqs)
-        self.record_layout = (None if self.options["IN_PLACE"] else tuple(
+        self.record_layout = (None if in_place else tuple(
             (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype) for tensor in (delta, keys, decay)))
         self.output_shape = tuple(output.shape)
         self.recovery_shapes = (tuple(queries.shape), tuple(beta.shape)) if self.prepare_args is not None else None
@@ -392,6 +554,7 @@ class PreparedRecoveredRecurrence:
 
     def __call__(self, mixed_qkv=None, a=None, b=None, *, projected=None, records=None, metadata=None):
         args, prepare_args = self.args, self.prepare_args
+        use_wy = getattr(self, "use_wy", False)
         output = None
         if args is None:
             if mixed_qkv is None or a is None or b is None:
@@ -429,9 +592,13 @@ class PreparedRecoveredRecurrence:
                         operands = (*operands[:2], metadata.convolution_slots, metadata.fresh,
                                     metadata.accepted_tokens, metadata.num_tokens)
                     prepare_args += (projected, *operands)
-            args = (mixed_qkv, a, b, A_log, dt_bias, state, starts, slots, num_seqs,
-                    output, delta, keys, decay, queries, beta, mixed_qkv.stride(0), a.stride(0),
-                    b.stride(0), *self.state_strides)
+            if use_wy:
+                args = (mixed_qkv, state, starts, slots, num_seqs, output, delta, keys, decay,
+                        queries, beta, mixed_qkv.stride(0), *self.state_strides)
+            else:
+                args = (mixed_qkv, a, b, A_log, dt_bias, state, starts, slots, num_seqs,
+                        output, delta, keys, decay, queries, beta, mixed_qkv.stride(0), a.stride(0),
+                        b.stride(0), *self.state_strides)
         elif records is not None:
             raise ValueError("runtime GDN correction records require functional recovery")
         if prepare_args is not None:
@@ -441,7 +608,7 @@ class PreparedRecoveredRecurrence:
             else:
                 launch_triton(_prepare_inputs, self.prepare_compiled, prepare_args,
                               self.prepare_grid, **self.prepare_options)
-        launch_triton(_verify, self.compiled, args, self.grid, **self.options)
+        launch_triton(_verify_wy if use_wy else _verify, self.compiled, args, self.grid, **self.options)
         return output
 
 
@@ -473,11 +640,19 @@ class PreparedGDNCommit:
         offsets.copy_(torch.tensor(layer_offsets, dtype=torch.int64))
         self.args = (floats, offsets, records.delta, records.keys, records.decay, metadata.state_indices[:, 0],
                      counts, metadata.num_seqs, floats.stride(0), metadata.state_indices.stride(0))
+        state_bytes = counts.numel() * len(records.layers) * value_heads * 128 * 128 * 4
+        streaming = state_bytes >= _COMMIT_STREAM_MIN_BYTES and _is_sm12x(backing.device)
+        self.streaming = streaming
+        commit_kernel = _commit_streaming if streaming else _commit
+        commit_rows = _COMMIT_STREAM_ROWS if streaming else ROWS
+        commit_config = _COMMIT_STREAM_CONFIG if streaming else _CONFIG
         self.options = {"ROWS_CAPACITY": records.delta.shape[1], "KEY_HEADS": key_heads, "VALUE_HEADS": value_heads,
-                        "WINDOW": metadata.state_indices.shape[1], "RECORD_WIDTH": records.delta.shape[3], "ROWS": ROWS, "STATE_ALIGNMENT": state_alignment}
-        self.grid = (128 // ROWS, counts.numel(), len(records.layers) * value_heads)
-        self.compiled = warmup_triton(_commit.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
-                                      num_stages=_CONFIG.num_stages, **self.options)
+                        "WINDOW": metadata.state_indices.shape[1], "RECORD_WIDTH": records.delta.shape[3],
+                        "ROWS": commit_rows, "STATE_ALIGNMENT": state_alignment}
+        self.grid = ((128 // commit_rows, len(records.layers) * value_heads, counts.numel())
+                     if streaming else (128 // commit_rows, counts.numel(), len(records.layers) * value_heads))
+        self.compiled = warmup_triton(commit_kernel.fn, self.args, self.grid, num_warps=commit_config.num_warps,
+                                      num_stages=commit_config.num_stages, **self.options)
 
     def functional(self, *, session=None, dynamic_metadata=False):
         """Keep state and layer indexing while consuming round-local records and counts."""
@@ -514,4 +689,5 @@ class PreparedGDNCommit:
             args = (state, offsets, delta, keys, decay, slots, counts, num_seqs, state_stride, slot_stride)
         elif counts is not None or records is not None:
             raise ValueError("runtime GDN commit operands require functional execution")
-        launch_triton(_commit, self.compiled, args, self.grid, **self.options)
+        launch_triton(_commit_streaming if getattr(self, "streaming", False) else _commit,
+                      self.compiled, args, self.grid, **self.options)
