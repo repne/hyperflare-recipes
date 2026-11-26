@@ -797,6 +797,14 @@ class PreparedDecoder:
             mode=state.mode, session=session, name=f"{name}.ple", workspace=workspaces,
             partitions=getattr(state, "ple_partitions", None),
             runtime=runtime if barrier_runtime is None else barrier_runtime, coordinator=coordinator)
+        if (
+            not self.row_shard_dma
+            and not self.pipelined_prefill
+            and len(self.layers) > 1
+            and hasattr(self.ple, "prepare_residual_norm")
+        ):
+            layer1_hc = self.layers[1][0]
+            self.ple.prepare_residual_norm(layer1_hc.norm_gain, eps=layer1_hc.eps)
         if self._single_row_final_mixer:
             final_hc_scratch = scratch.rows(1, 1)
             final_mixer_runtime = barrier_runtime if barrier_runtime is not None else runtime
@@ -1190,7 +1198,10 @@ class PreparedDecoder:
         if 0 in self.context_layers:
             self._capture_context_layer(capture, 0, residual)
 
-        residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
+        if hasattr(self.ple, "add_to_residual"):
+            residual, _ = self.ple.add_to_residual(residual, runtime.ple, getattr(runtime, "ple_partitions", None))
+        else:
+            residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
         res_a = torch.index_select(residual, 0, self.shard_rows_a)
         res_b = torch.index_select(residual, 0, self.shard_rows_b)
         sharded_ctx_slots: dict[int, torch.Tensor] = {}
@@ -1427,7 +1438,10 @@ class PreparedDecoder:
             is_qsa = index % 4 == 3
             has_row_gather = is_qsa and attention.sharded is not None and attention.sharded.mode == "row"
             if index == 1:
-                residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
+                if hasattr(self.ple, "add_to_residual"):
+                    residual, _ = self.ple.add_to_residual(residual, runtime.ple, getattr(runtime, "ple_partitions", None))
+                else:
+                    residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
                 res_a, res_b = residual[:h], residual[h:]
                 norm_a = norm_b = None
             if mlp_hc is None:
@@ -1563,8 +1577,13 @@ class PreparedDecoder:
             prefetched_mix = None
             for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
                 if index == 1:
-                    residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
-                    normalized = None
+                    if hasattr(self.ple, "add_to_residual"):
+                        residual, normalized = self.ple.add_to_residual(
+                            residual, runtime.ple, getattr(runtime, "ple_partitions", None),
+                        )
+                    else:
+                        residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
+                        normalized = None
                     prefetched_mix = None
                 if prefetched_mix is not None:
                     mixed, injection = prefetched_mix

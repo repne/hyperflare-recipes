@@ -11,6 +11,8 @@ import math
 from dataclasses import dataclass, fields
 
 import torch
+import triton
+import triton.language as tl
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.sequence import ple_embedding, short_conv
 from b12x.sequence.short_conv.api import _pipeline as short_conv_out
@@ -20,13 +22,264 @@ from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.recipes.qwen38.checkpoint import CheckpointManifest
 from ignition.progress import phase
 from .checkpoint_schema import PLE_PREFIX, TEXT_PREFIX
+from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.scratch import planned_scratch, prime_owners
+from ignition.preparation.triton import warmup_triton
 from ignition.preparation.tuning import declare, register_finalizer
 
 PLE_LAYER_PREFIX = f"{TEXT_PREFIX}.layers.1.ple"
 TABLE_ROWS = 320001536
 ROWS_PER_PLANE = 2500012
 TABLE_BYTES = TABLE_ROWS * 90
+_PLE_KERNEL_CONFIG = triton.Config({}, num_warps=4, num_stages=2)
+_PLE_MAX_INLINE_SEQS = 512
+
+
+@triton.autotune(configs=[_PLE_KERNEL_CONFIG], key=[])
+@triton.jit
+def _ple_gate_norm_5x512(
+    KEY,
+    VALUE,
+    SOURCE,
+    W_KEY,
+    W_QUERY,
+    W_CONV,
+    Q_START,
+    CONV_SLOTS,
+    NUM_SEQS,
+    NUM_TOKENS,
+    SIG_GATE,
+    NORMALIZED,
+    EPS_K: tl.constexpr,
+    EPS_Q: tl.constexpr,
+    EPS_C: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
+    EVICT_IO: tl.constexpr,
+):
+    """Fused PLE group-RMSNorm (key/query), BF16 dot-gate, value gating, conv-norm, and live mask.
+
+    Writes compact ``SIG_GATE`` ``[tokens, 4]`` (using ``-1.0`` as the inactive-row sentinel)
+    and ``NORMALIZED`` ``[tokens, 10240]``, avoiding materializing the intermediate ``gated``
+    buffer before ``short_conv``.
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    tok = pid // 4
+    stream = pid % 4
+    k = tl.arange(0, 512)
+    s_base = (tok * 4 + stream) * 2560
+    g_base = stream * 2560
+
+    s = tl.arange(0, SEQ_BLOCK)
+    sm = s < MAX_SEQS
+    num_seqs = tl.load(NUM_SEQS)
+    num_tokens = tl.load(NUM_TOKENS)
+    starts = tl.load(Q_START + s, mask=sm, other=0)
+    ends = tl.load(Q_START + s + 1, mask=sm, other=0)
+    slots = tl.load(CONV_SLOTS + s, mask=sm, other=-1)
+    tok_i32 = tok.to(tl.int32)
+    is_live = tl.sum(
+        (
+            (tok_i32 >= starts)
+            & (tok_i32 < ends)
+            & (s < num_seqs)
+            & (slots >= 0)
+            & (tok_i32 < num_tokens)
+            & sm
+        ).to(tl.int32),
+        axis=0,
+    ) > 0
+
+    if not is_live:
+        tl.store(SIG_GATE + tok * 4 + stream, tl.full((), -1.0, dtype=tl.bfloat16))
+        z = tl.zeros((512,), dtype=tl.bfloat16)
+        tl.store(NORMALIZED + s_base + k, z)
+        tl.store(NORMALIZED + s_base + 512 + k, z)
+        tl.store(NORMALIZED + s_base + 1024 + k, z)
+        tl.store(NORMALIZED + s_base + 1536 + k, z)
+        tl.store(NORMALIZED + s_base + 2048 + k, z)
+        return
+
+    if EVICT_IO:
+        k0 = tl.load(KEY + s_base + k, eviction_policy="evict_first").to(tl.float32)
+        k1 = tl.load(KEY + s_base + 512 + k, eviction_policy="evict_first").to(tl.float32)
+        k2 = tl.load(KEY + s_base + 1024 + k, eviction_policy="evict_first").to(tl.float32)
+        k3 = tl.load(KEY + s_base + 1536 + k, eviction_policy="evict_first").to(tl.float32)
+        k4 = tl.load(KEY + s_base + 2048 + k, eviction_policy="evict_first").to(tl.float32)
+    else:
+        k0 = tl.load(KEY + s_base + k).to(tl.float32)
+        k1 = tl.load(KEY + s_base + 512 + k).to(tl.float32)
+        k2 = tl.load(KEY + s_base + 1024 + k).to(tl.float32)
+        k3 = tl.load(KEY + s_base + 1536 + k).to(tl.float32)
+        k4 = tl.load(KEY + s_base + 2048 + k).to(tl.float32)
+    inv_k = tl.rsqrt(tl.sum(k0 * k0 + k1 * k1 + k2 * k2 + k3 * k3 + k4 * k4, axis=0) * (1.0 / 2560.0) + EPS_K)
+    kn0 = (k0 * inv_k * tl.load(W_KEY + g_base + k)).to(tl.bfloat16).to(tl.float32)
+    kn1 = (k1 * inv_k * tl.load(W_KEY + g_base + 512 + k)).to(tl.bfloat16).to(tl.float32)
+    kn2 = (k2 * inv_k * tl.load(W_KEY + g_base + 1024 + k)).to(tl.bfloat16).to(tl.float32)
+    kn3 = (k3 * inv_k * tl.load(W_KEY + g_base + 1536 + k)).to(tl.bfloat16).to(tl.float32)
+    kn4 = (k4 * inv_k * tl.load(W_KEY + g_base + 2048 + k)).to(tl.bfloat16).to(tl.float32)
+
+    if EVICT_IO:
+        q0 = tl.load(SOURCE + s_base + k, eviction_policy="evict_first").to(tl.float32)
+        q1 = tl.load(SOURCE + s_base + 512 + k, eviction_policy="evict_first").to(tl.float32)
+        q2 = tl.load(SOURCE + s_base + 1024 + k, eviction_policy="evict_first").to(tl.float32)
+        q3 = tl.load(SOURCE + s_base + 1536 + k, eviction_policy="evict_first").to(tl.float32)
+        q4 = tl.load(SOURCE + s_base + 2048 + k, eviction_policy="evict_first").to(tl.float32)
+    else:
+        q0 = tl.load(SOURCE + s_base + k).to(tl.float32)
+        q1 = tl.load(SOURCE + s_base + 512 + k).to(tl.float32)
+        q2 = tl.load(SOURCE + s_base + 1024 + k).to(tl.float32)
+        q3 = tl.load(SOURCE + s_base + 1536 + k).to(tl.float32)
+        q4 = tl.load(SOURCE + s_base + 2048 + k).to(tl.float32)
+    inv_q = tl.rsqrt(tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4, axis=0) * (1.0 / 2560.0) + EPS_Q)
+    qn0 = (q0 * inv_q * tl.load(W_QUERY + g_base + k)).to(tl.bfloat16).to(tl.float32)
+    qn1 = (q1 * inv_q * tl.load(W_QUERY + g_base + 512 + k)).to(tl.bfloat16).to(tl.float32)
+    qn2 = (q2 * inv_q * tl.load(W_QUERY + g_base + 1024 + k)).to(tl.bfloat16).to(tl.float32)
+    qn3 = (q3 * inv_q * tl.load(W_QUERY + g_base + 1536 + k)).to(tl.bfloat16).to(tl.float32)
+    qn4 = (q4 * inv_q * tl.load(W_QUERY + g_base + 2048 + k)).to(tl.bfloat16).to(tl.float32)
+
+    dot = tl.sum(
+        (kn0 * qn0).to(tl.bfloat16).to(tl.float32)
+        + (kn1 * qn1).to(tl.bfloat16).to(tl.float32)
+        + (kn2 * qn2).to(tl.bfloat16).to(tl.float32)
+        + (kn3 * qn3).to(tl.bfloat16).to(tl.float32)
+        + (kn4 * qn4).to(tl.bfloat16).to(tl.float32),
+        axis=0,
+    ).to(tl.bfloat16).to(tl.float32)
+    gate = (dot / 50.59644256269407).to(tl.bfloat16).to(tl.float32)
+    sign = tl.where(gate > 0.0, 1.0, tl.where(gate < 0.0, -1.0, 0.0))
+    clamped = tl.maximum(tl.abs(gate), 1e-6).to(tl.bfloat16).to(tl.float32)
+    gate_s = (tl.sqrt(clamped).to(tl.bfloat16).to(tl.float32) * sign).to(tl.bfloat16).to(tl.float32)
+    sig_bf16 = tl.sigmoid(gate_s).to(tl.bfloat16)
+    tl.store(SIG_GATE + tok * 4 + stream, sig_bf16)
+    sig = sig_bf16.to(tl.float32)
+
+    val_base = tok * 2560
+    g0 = (sig * tl.load(VALUE + val_base + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    g1 = (sig * tl.load(VALUE + val_base + 512 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    g2 = (sig * tl.load(VALUE + val_base + 1024 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    g3 = (sig * tl.load(VALUE + val_base + 1536 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    g4 = (sig * tl.load(VALUE + val_base + 2048 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+
+    inv_c = tl.rsqrt(tl.sum(g0 * g0 + g1 * g1 + g2 * g2 + g3 * g3 + g4 * g4, axis=0) * (1.0 / 2560.0) + EPS_C)
+    n0 = (g0 * inv_c * tl.load(W_CONV + g_base + k)).to(tl.bfloat16)
+    n1 = (g1 * inv_c * tl.load(W_CONV + g_base + 512 + k)).to(tl.bfloat16)
+    n2 = (g2 * inv_c * tl.load(W_CONV + g_base + 1024 + k)).to(tl.bfloat16)
+    n3 = (g3 * inv_c * tl.load(W_CONV + g_base + 1536 + k)).to(tl.bfloat16)
+    n4 = (g4 * inv_c * tl.load(W_CONV + g_base + 2048 + k)).to(tl.bfloat16)
+
+    if EVICT_IO:
+        tl.store(NORMALIZED + s_base + k, n0, eviction_policy="evict_first")
+        tl.store(NORMALIZED + s_base + 512 + k, n1, eviction_policy="evict_first")
+        tl.store(NORMALIZED + s_base + 1024 + k, n2, eviction_policy="evict_first")
+        tl.store(NORMALIZED + s_base + 1536 + k, n3, eviction_policy="evict_first")
+        tl.store(NORMALIZED + s_base + 2048 + k, n4, eviction_policy="evict_first")
+    else:
+        tl.store(NORMALIZED + s_base + k, n0)
+        tl.store(NORMALIZED + s_base + 512 + k, n1)
+        tl.store(NORMALIZED + s_base + 1024 + k, n2)
+        tl.store(NORMALIZED + s_base + 1536 + k, n3)
+        tl.store(NORMALIZED + s_base + 2048 + k, n4)
+
+
+@triton.autotune(configs=[_PLE_KERNEL_CONFIG], key=[])
+@triton.jit
+def _ple_combine_output_5x512(
+    RESIDUAL,
+    CONVOLVED,
+    VALUE,
+    SIG_GATE,
+    NORM_GAIN,
+    OUT,
+    NEXT_NORM,
+    ADD_RESIDUAL: tl.constexpr,
+    EMIT_NORM: tl.constexpr,
+    NORM_EPS: tl.constexpr,
+    EVICT_IO: tl.constexpr,
+):
+    """Combine rank-1 gated PLE values with short-conv output, optional residual add, and next norm."""
+    pid = tl.program_id(0).to(tl.int64)
+    tok = pid // 4
+    stream = pid % 4
+    k = tl.arange(0, 512)
+    s_base = (tok * 4 + stream) * 2560
+    val_base = tok * 2560
+    g_base = stream * 2560
+
+    sig = tl.load(SIG_GATE + tok * 4 + stream).to(tl.float32)
+    if sig >= 0.0:
+        g0 = (sig * tl.load(VALUE + val_base + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g1 = (sig * tl.load(VALUE + val_base + 512 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g2 = (sig * tl.load(VALUE + val_base + 1024 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g3 = (sig * tl.load(VALUE + val_base + 1536 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        g4 = (sig * tl.load(VALUE + val_base + 2048 + k).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    else:
+        g0 = tl.zeros((512,), dtype=tl.float32)
+        g1 = tl.zeros((512,), dtype=tl.float32)
+        g2 = tl.zeros((512,), dtype=tl.float32)
+        g3 = tl.zeros((512,), dtype=tl.float32)
+        g4 = tl.zeros((512,), dtype=tl.float32)
+
+    if EVICT_IO:
+        c0 = tl.load(CONVOLVED + s_base + k, eviction_policy="evict_first").to(tl.float32)
+        c1 = tl.load(CONVOLVED + s_base + 512 + k, eviction_policy="evict_first").to(tl.float32)
+        c2 = tl.load(CONVOLVED + s_base + 1024 + k, eviction_policy="evict_first").to(tl.float32)
+        c3 = tl.load(CONVOLVED + s_base + 1536 + k, eviction_policy="evict_first").to(tl.float32)
+        c4 = tl.load(CONVOLVED + s_base + 2048 + k, eviction_policy="evict_first").to(tl.float32)
+    else:
+        c0 = tl.load(CONVOLVED + s_base + k).to(tl.float32)
+        c1 = tl.load(CONVOLVED + s_base + 512 + k).to(tl.float32)
+        c2 = tl.load(CONVOLVED + s_base + 1024 + k).to(tl.float32)
+        c3 = tl.load(CONVOLVED + s_base + 1536 + k).to(tl.float32)
+        c4 = tl.load(CONVOLVED + s_base + 2048 + k).to(tl.float32)
+
+    p0 = (g0 + c0).to(tl.bfloat16)
+    p1 = (g1 + c1).to(tl.bfloat16)
+    p2 = (g2 + c2).to(tl.bfloat16)
+    p3 = (g3 + c3).to(tl.bfloat16)
+    p4 = (g4 + c4).to(tl.bfloat16)
+
+    if ADD_RESIDUAL:
+        if EVICT_IO:
+            r0 = (tl.load(RESIDUAL + s_base + k, eviction_policy="evict_first").to(tl.float32) + p0.to(tl.float32)).to(tl.bfloat16)
+            r1 = (tl.load(RESIDUAL + s_base + 512 + k, eviction_policy="evict_first").to(tl.float32) + p1.to(tl.float32)).to(tl.bfloat16)
+            r2 = (tl.load(RESIDUAL + s_base + 1024 + k, eviction_policy="evict_first").to(tl.float32) + p2.to(tl.float32)).to(tl.bfloat16)
+            r3 = (tl.load(RESIDUAL + s_base + 1536 + k, eviction_policy="evict_first").to(tl.float32) + p3.to(tl.float32)).to(tl.bfloat16)
+            r4 = (tl.load(RESIDUAL + s_base + 2048 + k, eviction_policy="evict_first").to(tl.float32) + p4.to(tl.float32)).to(tl.bfloat16)
+        else:
+            r0 = (tl.load(RESIDUAL + s_base + k).to(tl.float32) + p0.to(tl.float32)).to(tl.bfloat16)
+            r1 = (tl.load(RESIDUAL + s_base + 512 + k).to(tl.float32) + p1.to(tl.float32)).to(tl.bfloat16)
+            r2 = (tl.load(RESIDUAL + s_base + 1024 + k).to(tl.float32) + p2.to(tl.float32)).to(tl.bfloat16)
+            r3 = (tl.load(RESIDUAL + s_base + 1536 + k).to(tl.float32) + p3.to(tl.float32)).to(tl.bfloat16)
+            r4 = (tl.load(RESIDUAL + s_base + 2048 + k).to(tl.float32) + p4.to(tl.float32)).to(tl.bfloat16)
+    else:
+        r0, r1, r2, r3, r4 = p0, p1, p2, p3, p4
+
+    if EVICT_IO:
+        tl.store(OUT + s_base + k, r0, eviction_policy="evict_first")
+        tl.store(OUT + s_base + 512 + k, r1, eviction_policy="evict_first")
+        tl.store(OUT + s_base + 1024 + k, r2, eviction_policy="evict_first")
+        tl.store(OUT + s_base + 1536 + k, r3, eviction_policy="evict_first")
+        tl.store(OUT + s_base + 2048 + k, r4, eviction_policy="evict_first")
+    else:
+        tl.store(OUT + s_base + k, r0)
+        tl.store(OUT + s_base + 512 + k, r1)
+        tl.store(OUT + s_base + 1024 + k, r2)
+        tl.store(OUT + s_base + 1536 + k, r3)
+        tl.store(OUT + s_base + 2048 + k, r4)
+
+    if EMIT_NORM:
+        f0 = r0.to(tl.float32)
+        f1 = r1.to(tl.float32)
+        f2 = r2.to(tl.float32)
+        f3 = r3.to(tl.float32)
+        f4 = r4.to(tl.float32)
+        inv = tl.rsqrt(tl.sum(f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3 + f4 * f4, axis=0) * (1.0 / 2560.0) + NORM_EPS)
+        tl.store(NEXT_NORM + s_base + k, (f0 * inv * tl.load(NORM_GAIN + g_base + k)).to(tl.bfloat16))
+        tl.store(NEXT_NORM + s_base + 512 + k, (f1 * inv * tl.load(NORM_GAIN + g_base + 512 + k)).to(tl.bfloat16))
+        tl.store(NEXT_NORM + s_base + 1024 + k, (f2 * inv * tl.load(NORM_GAIN + g_base + 1024 + k)).to(tl.bfloat16))
+        tl.store(NEXT_NORM + s_base + 1536 + k, (f3 * inv * tl.load(NORM_GAIN + g_base + 1536 + k)).to(tl.bfloat16))
+        tl.store(NEXT_NORM + s_base + 2048 + k, (f4 * inv * tl.load(NORM_GAIN + g_base + 2048 + k)).to(tl.bfloat16))
 
 
 def _read_small(manifest: CheckpointManifest, name: str) -> torch.Tensor:
@@ -426,6 +679,94 @@ class PreparedPLE:
         self.sequence_rows = torch.arange(
             sequences, dtype=torch.int32, device=self.device
         ).view(1, -1)
+        self._max_seqs = sequences
+        self._fused_triton = sequences <= _PLE_MAX_INLINE_SEQS
+        self._evict_io = self.tokens >= 2048
+        self._ple_grid = (self.tokens * 4, 1, 1)
+        self._w_key = self._w_query = self._w_conv = None
+        self._next_norm_gain = None
+        self._next_norm_eps = 0.0
+        if self._fused_triton:
+            self._w_key = persistent_copy((1.0 + module.norm_key.weight.detach().float()).contiguous())
+            self._w_query = persistent_copy((1.0 + module.norm_query.weight.detach().float()).contiguous())
+            self._w_conv = persistent_copy((1.0 + module.norm_conv.weight.detach().float()).contiguous())
+            self._gate_options = {
+                "EPS_K": float(module.norm_key.eps),
+                "EPS_Q": float(module.norm_query.eps),
+                "EPS_C": float(module.norm_conv.eps),
+                "MAX_SEQS": sequences,
+                "SEQ_BLOCK": triton.next_power_of_2(sequences),
+                "EVICT_IO": self._evict_io,
+            }
+            sig_gate = torch.empty((self.tokens, 4), dtype=torch.bfloat16, device=self.device)
+            warmup_triton(
+                _ple_gate_norm_5x512.fn,
+                (
+                    scratch.key,
+                    scratch.value,
+                    source.view(self.tokens, 10240),
+                    self._w_key,
+                    self._w_query,
+                    self._w_conv,
+                    metadata.query_start_loc,
+                    metadata.convolution_slots,
+                    metadata.num_seqs,
+                    metadata.num_tokens,
+                    sig_gate,
+                    scratch.normalized,
+                ),
+                self._ple_grid,
+                num_warps=_PLE_KERNEL_CONFIG.num_warps,
+                num_stages=_PLE_KERNEL_CONFIG.num_stages,
+                **self._gate_options,
+            )
+            for add_residual in (False, True):
+                warmup_triton(
+                    _ple_combine_output_5x512.fn,
+                    (
+                        source.view(self.tokens, 10240),
+                        scratch.convolved,
+                        scratch.value,
+                        sig_gate,
+                        self._w_conv,
+                        scratch.output,
+                        scratch.gated,
+                    ),
+                    self._ple_grid,
+                    num_warps=_PLE_KERNEL_CONFIG.num_warps,
+                    num_stages=_PLE_KERNEL_CONFIG.num_stages,
+                    ADD_RESIDUAL=add_residual,
+                    EMIT_NORM=False,
+                    NORM_EPS=0.0,
+                    EVICT_IO=self._evict_io,
+                )
+
+    def prepare_residual_norm(self, norm_gain: torch.Tensor, *, eps: float) -> None:
+        """Warm up fused residual addition + following layer grouped RMSNorm."""
+        if not self._fused_triton or self.scratch is None:
+            return
+        self._next_norm_gain = norm_gain
+        self._next_norm_eps = float(eps)
+        sig_gate = torch.empty((self.tokens, 4), dtype=torch.bfloat16, device=self.device)
+        warmup_triton(
+            _ple_combine_output_5x512.fn,
+            (
+                self.source.view(self.tokens, 10240),
+                self.scratch.convolved,
+                self.scratch.value,
+                sig_gate,
+                norm_gain,
+                self.scratch.output,
+                self.scratch.gated,
+            ),
+            self._ple_grid,
+            num_warps=_PLE_KERNEL_CONFIG.num_warps,
+            num_stages=_PLE_KERNEL_CONFIG.num_stages,
+            ADD_RESIDUAL=True,
+            EMIT_NORM=True,
+            NORM_EPS=self._next_norm_eps,
+            EVICT_IO=self._evict_io,
+        )
 
     def _prepare_binding(self, plan, args, session, name, public_bind, *,
                          attribute, bind_plan=False, workspace=None):
@@ -467,7 +808,82 @@ class PreparedPLE:
         self.embedding_output = self.partitions = None
         self.token_rows = self.sequence_rows = None
 
+    def _run_convolve(self, normalized: torch.Tensor, metadata, partitions) -> torch.Tensor:
+        if partitions is None:
+            convolved = torch.empty_like(normalized)
+            gathered, request_ids = (torch.empty_strided(shape, stride, dtype=dtype, device=normalized.device)
+                for shape, stride, dtype in self.convolution_scratch)
+            short_conv_out(normalized, self.module.conv1d.weight.squeeze(1), metadata.query_start_loc,
+                metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.fresh,
+                metadata.num_seqs, metadata.num_tokens, self.state, convolved, gathered, request_ids,
+                None, self.convolution_plan.handle)
+            return convolved
+        values = tuple(convolution(part.gather(normalized), part.metadata)
+            for part, convolution in zip(partitions.parts, self.convolutions, strict=True))
+        return partitions.combine(values)
+
+    def _run_fused(self, source: torch.Tensor, metadata, partitions, *, add_residual: bool, emit_norm: bool):
+        embedding = self.embedding_lookup(source, metadata)
+        key_raw = self.key_projection(embedding)
+        value = self.value_projection(embedding)
+        src_flat = source.view(self.tokens, 10240)
+        sig_gate = torch.empty((self.tokens, 4), dtype=torch.bfloat16, device=source.device)
+        normalized = torch.empty((self.tokens, 10240), dtype=torch.bfloat16, device=source.device)
+        torch.library.wrap_triton(_ple_gate_norm_5x512)[self._ple_grid](
+            key_raw,
+            value,
+            src_flat,
+            self._w_key,
+            self._w_query,
+            self._w_conv,
+            metadata.query_start_loc,
+            metadata.convolution_slots,
+            metadata.num_seqs,
+            metadata.num_tokens,
+            sig_gate,
+            normalized,
+            **self._gate_options,
+        )
+        convolved = self._run_convolve(normalized, metadata, partitions)
+        out = torch.empty((self.tokens, 10240), dtype=torch.bfloat16, device=source.device)
+        if emit_norm:
+            next_norm = torch.empty((self.tokens, 10240), dtype=torch.bfloat16, device=source.device)
+            gain = self._next_norm_gain
+            norm_eps = self._next_norm_eps
+        else:
+            next_norm = torch.empty((1,), dtype=torch.bfloat16, device=source.device)
+            gain = self._w_conv
+            norm_eps = 0.0
+        torch.library.wrap_triton(_ple_combine_output_5x512)[self._ple_grid](
+            src_flat,
+            convolved,
+            value,
+            sig_gate,
+            gain,
+            out,
+            next_norm,
+            ADD_RESIDUAL=add_residual,
+            EMIT_NORM=emit_norm,
+            NORM_EPS=norm_eps,
+            EVICT_IO=self._evict_io,
+        )
+        return out, (next_norm if emit_norm else None)
+
+    def add_to_residual(self, residual: torch.Tensor, metadata, partitions=None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Compute PLE contribution, add it to ``residual``, and optionally emit layer-1 norm."""
+        if getattr(self, "_fused_triton", False):
+            return self._run_fused(
+                residual, metadata, partitions,
+                add_residual=True,
+                emit_norm=self._next_norm_gain is not None,
+            )
+        residual.add_(self(residual, metadata, partitions))
+        return residual, None
+
     def __call__(self, source: torch.Tensor, metadata, partitions=None) -> torch.Tensor:
+        if getattr(self, "_fused_triton", False):
+            out, _ = self._run_fused(source, metadata, partitions, add_residual=False, emit_norm=False)
+            return out
         embedding = self.embedding_lookup(source, metadata)
         key = self.module.norm_key(self.key_projection(embedding)).view(self.tokens, 4, 2560)
         value = self.value_projection(embedding)
@@ -485,18 +901,7 @@ class PreparedPLE:
             & (token_rows < metadata.num_tokens)).any(dim=1, keepdim=True)
         gated = gated.masked_fill(~live, 0)
         normalized = normalized.masked_fill(~live, 0)
-        if partitions is None:
-            convolved = torch.empty_like(normalized)
-            gathered, request_ids = (torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-                for shape, stride, dtype in self.convolution_scratch)
-            short_conv_out(normalized, self.module.conv1d.weight.squeeze(1), metadata.query_start_loc,
-                metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.fresh,
-                metadata.num_seqs, metadata.num_tokens, self.state, convolved, gathered, request_ids,
-                None, self.convolution_plan.handle)
-        else:
-            values = tuple(convolution(part.gather(normalized), part.metadata)
-                for part, convolution in zip(partitions.parts, self.convolutions, strict=True))
-            convolved = partitions.combine(values)
+        convolved = self._run_convolve(normalized, metadata, partitions)
         return gated + convolved
 
 

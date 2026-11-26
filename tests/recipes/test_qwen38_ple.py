@@ -448,3 +448,137 @@ def test_ple_rank_rows_cover_the_checkpoint_once(manifest, world):
         if rank:
             assert layouts[rank - 1].shard_end == layout.shard_start
     assert sum(layout.weight_shape[0] * 90 for layout in layouts) == TABLE_BYTES
+
+
+@CUDA
+@torch.no_grad()
+@pytest.mark.parametrize("tokens,sequences", ((1, 1), (32, 3), (128, 16), (256, 1)))
+def test_fused_ple_triton_kernels_compiled_parity(tokens, sequences):
+    import math
+    import triton
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
+    from hyperflare_recipes.recipes.qwen38.ple import (
+        _PLE_KERNEL_CONFIG,
+        _ple_combine_output_5x512,
+        _ple_gate_norm_5x512,
+    )
+    from ignition.preparation.triton import warmup_triton
+
+    device = torch.device("cuda", 0)
+    gen = torch.Generator(device=device).manual_seed(1701 + tokens * 13 + sequences)
+    key_raw = torch.randn((tokens, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.2
+    value = torch.randn((tokens, 2560), generator=gen, dtype=torch.bfloat16, device=device) * 0.2
+    source = torch.randn((tokens, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.2
+    convolved = torch.randn((tokens, 10240), generator=gen, dtype=torch.bfloat16, device=device) * 0.2
+    norm_key = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    norm_query = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    norm_conv = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    next_norm_mod = Qwen4ExpTextRMSNorm(10240, group_size=2560, eps=1e-6).to(device)
+    for mod in (norm_key, norm_query, norm_conv, next_norm_mod):
+        mod.weight.normal_(0.0, 0.1, generator=gen)
+    w_key = (1.0 + norm_key.weight.float()).contiguous()
+    w_query = (1.0 + norm_query.weight.float()).contiguous()
+    w_conv = (1.0 + norm_conv.weight.float()).contiguous()
+    w_next = (1.0 + next_norm_mod.weight.float()).contiguous()
+
+    # Exercise active tokens, trailing padded tokens, and an inactive sequence slot.
+    active_tokens = max(1, tokens - (3 if tokens > 4 else 0))
+    starts = torch.linspace(0, active_tokens, sequences + 1, dtype=torch.int32, device=device)
+    slots = torch.arange(sequences, dtype=torch.int64, device=device)
+    if sequences > 1:
+        slots[-1] = -1
+    num_seqs = torch.tensor([sequences], dtype=torch.int32, device=device)
+    num_tokens = torch.tensor([active_tokens], dtype=torch.int32, device=device)
+
+    grid = (tokens * 4, 1, 1)
+    gate_opts = {
+        "EPS_K": 1e-6,
+        "EPS_Q": 1e-6,
+        "EPS_C": 1e-6,
+        "MAX_SEQS": sequences,
+        "SEQ_BLOCK": triton.next_power_of_2(sequences),
+        "EVICT_IO": tokens >= 2048,
+    }
+    sig_tmp = torch.empty((tokens, 4), dtype=torch.bfloat16, device=device)
+    norm_tmp = torch.empty_like(source)
+    out_tmp = torch.empty_like(source)
+    next_tmp = torch.empty_like(source)
+    warmup_triton(
+        _ple_gate_norm_5x512.fn,
+        (key_raw, value, source, w_key, w_query, w_conv, starts, slots, num_seqs, num_tokens, sig_tmp, norm_tmp),
+        grid,
+        num_warps=_PLE_KERNEL_CONFIG.num_warps,
+        num_stages=_PLE_KERNEL_CONFIG.num_stages,
+        **gate_opts,
+    )
+    for add_res, emit_norm in ((False, False), (True, False), (True, True)):
+        warmup_triton(
+            _ple_combine_output_5x512.fn,
+            (source, convolved, value, sig_tmp, w_next, out_tmp, next_tmp),
+            grid,
+            num_warps=_PLE_KERNEL_CONFIG.num_warps,
+            num_stages=_PLE_KERNEL_CONFIG.num_stages,
+            ADD_RESIDUAL=add_res,
+            EMIT_NORM=emit_norm,
+            NORM_EPS=1e-6 if emit_norm else 0.0,
+            EVICT_IO=tokens >= 2048,
+        )
+
+    def run_fused(k_in, v_in, s_in, c_in, st, sl, ns, nt):
+        sig = torch.empty((tokens, 4), dtype=torch.bfloat16, device=device)
+        norm = torch.empty_like(s_in)
+        torch.library.wrap_triton(_ple_gate_norm_5x512)[grid](
+            k_in, v_in, s_in, w_key, w_query, w_conv, st, sl, ns, nt, sig, norm, **gate_opts,
+        )
+        ple_only = torch.empty_like(s_in)
+        dummy = torch.empty((1,), dtype=torch.bfloat16, device=device)
+        torch.library.wrap_triton(_ple_combine_output_5x512)[grid](
+            s_in, c_in, v_in, sig, w_conv, ple_only, dummy,
+            ADD_RESIDUAL=False, EMIT_NORM=False, NORM_EPS=0.0, EVICT_IO=tokens >= 2048,
+        )
+        res_out = torch.empty_like(s_in)
+        next_norm = torch.empty_like(s_in)
+        torch.library.wrap_triton(_ple_combine_output_5x512)[grid](
+            s_in, c_in, v_in, sig, w_next, res_out, next_norm,
+            ADD_RESIDUAL=True, EMIT_NORM=True, NORM_EPS=1e-6, EVICT_IO=tokens >= 2048,
+        )
+        return norm, ple_only, res_out, next_norm
+
+    compiled = torch.compile(run_fused, fullgraph=True)
+
+    for ns_val, nt_val in ((sequences, active_tokens), (0, 0)):
+        num_seqs.fill_(ns_val)
+        num_tokens.fill_(nt_val)
+        norm_got, ple_got, res_got, next_got = compiled(
+            key_raw, value, source, convolved, starts, slots, num_seqs, num_tokens,
+        )
+        key = norm_key(key_raw).view(tokens, 4, 2560)
+        query = norm_query(source).view(tokens, 4, 2560)
+        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(2560)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gated = (torch.sigmoid(gate) * value.unsqueeze(1)).flatten(1)
+        norm_ref = norm_conv(gated)
+        token_rows = torch.arange(tokens, dtype=torch.int32, device=device).view(-1, 1)
+        seq_rows = torch.arange(sequences, dtype=torch.int32, device=device).view(1, -1)
+        live = (
+            (token_rows >= starts[:-1].view(1, -1))
+            & (token_rows < starts[1:].view(1, -1))
+            & (seq_rows < num_seqs)
+            & (slots.view(1, -1) >= 0)
+            & (token_rows < num_tokens)
+        ).any(dim=1, keepdim=True)
+        gated_ref = gated.masked_fill(~live, 0)
+        norm_ref = norm_ref.masked_fill(~live, 0)
+        ple_ref = gated_ref + convolved
+        res_ref = source + ple_ref
+        next_ref = next_norm_mod(res_ref)
+
+        if ns_val == 0:
+            assert torch.count_nonzero(norm_got) == 0
+            assert torch.equal(ple_got, convolved)
+            assert torch.equal(res_got, source + convolved)
+        else:
+            for got, ref in ((norm_got, norm_ref), (ple_got, ple_ref), (res_got, res_ref), (next_got, next_ref)):
+                rel = float((got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12))
+                assert rel < 1e-3, f"relL2={rel}"
+            assert torch.count_nonzero(norm_got[~live[:, 0]]) == 0
