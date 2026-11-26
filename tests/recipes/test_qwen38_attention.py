@@ -150,6 +150,8 @@ def test_prepared_attention_validates_qk_norms(monkeypatch):
     monkeypatch.setattr(attention_mod.qsa, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(attention_mod.qsa, "invocation_from_tensors", lambda *args, **kwargs: kwargs)
     monkeypatch.setattr(attention_mod.qsa, "plan", lambda *args, **kwargs: DummyPlan())
+    monkeypatch.setattr(attention_mod.paged_kv_write, "Caps", lambda **kwargs: kwargs)
+    monkeypatch.setattr(attention_mod.paged_kv_write, "plan", lambda *args, **kwargs: DummyPlan())
 
     device = torch.device("cpu")
     source = torch.zeros((16, 2560), dtype=torch.bfloat16)
