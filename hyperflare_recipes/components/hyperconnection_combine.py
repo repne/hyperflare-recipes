@@ -321,18 +321,22 @@ def _combine_norm_down_m1_split4(
         n3.to(tl.float32),
         n4.to(tl.float32),
     )
-    for bi in tl.static_range(BR):
-        r = r0 + bi
-        if r < OUT_ROWS:
-            wb = r.to(tl.int64) * (S * H) + s_base
-            d = (
-                nf0 * tl.load(DOWN_W + wb + k, eviction_policy="evict_first").to(tl.float32)
-                + nf1 * tl.load(DOWN_W + wb + 512 + k, eviction_policy="evict_first").to(tl.float32)
-                + nf2 * tl.load(DOWN_W + wb + 1024 + k, eviction_policy="evict_first").to(tl.float32)
-                + nf3 * tl.load(DOWN_W + wb + 1536 + k, eviction_policy="evict_first").to(tl.float32)
-                + nf4 * tl.load(DOWN_W + wb + 2048 + k, eviction_policy="evict_first").to(tl.float32)
-            )
-            tl.store(PARTIAL + stream * OUT_ROWS + r, tl.sum(d, axis=0))
+    rs = r0 + tl.arange(0, BR)
+    rm = rs < OUT_ROWS
+    wbase = rs.to(tl.int64)[:, None] * (S * H) + s_base
+    acc = (
+        nf0[None, :]
+        * tl.load(DOWN_W + wbase + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        + nf1[None, :]
+        * tl.load(DOWN_W + wbase + 512 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        + nf2[None, :]
+        * tl.load(DOWN_W + wbase + 1024 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        + nf3[None, :]
+        * tl.load(DOWN_W + wbase + 1536 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        + nf4[None, :]
+        * tl.load(DOWN_W + wbase + 2048 + k[None, :], mask=rm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+    )
+    tl.store(PARTIAL + stream * OUT_ROWS + rs, tl.sum(acc, axis=1), mask=rm)
 
 
 @triton.autotune(configs=[_M1_PARTIAL_GATE_CONFIG], key=[])
@@ -363,57 +367,31 @@ def _hc_gate_m1_from_partial(
 
     h = pid * BH + tl.arange(0, BH)
     hm = h < H
-    k0 = tl.arange(0, 64)
+    k256 = tl.arange(0, 256)
+    k64 = tl.arange(0, 64)
     r0 = (
-        tl.load(PARTIAL + 0 * OUT_ROWS + k0)
-        + tl.load(PARTIAL + 1 * OUT_ROWS + k0)
-        + tl.load(PARTIAL + 2 * OUT_ROWS + k0)
-        + tl.load(PARTIAL + 3 * OUT_ROWS + k0)
+        tl.load(PARTIAL + 0 * OUT_ROWS + k256)
+        + tl.load(PARTIAL + 1 * OUT_ROWS + k256)
+        + tl.load(PARTIAL + 2 * OUT_ROWS + k256)
+        + tl.load(PARTIAL + 3 * OUT_ROWS + k256)
     ).to(tl.bfloat16).to(tl.float32)
     s0 = (r0 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
     x0 = (s0 * tl.sigmoid(s0)).to(tl.bfloat16).to(tl.float32)
     r1 = (
-        tl.load(PARTIAL + 0 * OUT_ROWS + 64 + k0)
-        + tl.load(PARTIAL + 1 * OUT_ROWS + 64 + k0)
-        + tl.load(PARTIAL + 2 * OUT_ROWS + 64 + k0)
-        + tl.load(PARTIAL + 3 * OUT_ROWS + 64 + k0)
+        tl.load(PARTIAL + 0 * OUT_ROWS + 256 + k64)
+        + tl.load(PARTIAL + 1 * OUT_ROWS + 256 + k64)
+        + tl.load(PARTIAL + 2 * OUT_ROWS + 256 + k64)
+        + tl.load(PARTIAL + 3 * OUT_ROWS + 256 + k64)
     ).to(tl.bfloat16).to(tl.float32)
     s1 = (r1 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
     x1 = (s1 * tl.sigmoid(s1)).to(tl.bfloat16).to(tl.float32)
-    r2 = (
-        tl.load(PARTIAL + 0 * OUT_ROWS + 128 + k0)
-        + tl.load(PARTIAL + 1 * OUT_ROWS + 128 + k0)
-        + tl.load(PARTIAL + 2 * OUT_ROWS + 128 + k0)
-        + tl.load(PARTIAL + 3 * OUT_ROWS + 128 + k0)
-    ).to(tl.bfloat16).to(tl.float32)
-    s2 = (r2 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
-    x2 = (s2 * tl.sigmoid(s2)).to(tl.bfloat16).to(tl.float32)
-    r3 = (
-        tl.load(PARTIAL + 0 * OUT_ROWS + 192 + k0)
-        + tl.load(PARTIAL + 1 * OUT_ROWS + 192 + k0)
-        + tl.load(PARTIAL + 2 * OUT_ROWS + 192 + k0)
-        + tl.load(PARTIAL + 3 * OUT_ROWS + 192 + k0)
-    ).to(tl.bfloat16).to(tl.float32)
-    s3 = (r3 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
-    x3 = (s3 * tl.sigmoid(s3)).to(tl.bfloat16).to(tl.float32)
-    r4 = (
-        tl.load(PARTIAL + 0 * OUT_ROWS + 256 + k0)
-        + tl.load(PARTIAL + 1 * OUT_ROWS + 256 + k0)
-        + tl.load(PARTIAL + 2 * OUT_ROWS + 256 + k0)
-        + tl.load(PARTIAL + 3 * OUT_ROWS + 256 + k0)
-    ).to(tl.bfloat16).to(tl.float32)
-    s4 = (r4 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
-    x4 = (s4 * tl.sigmoid(s4)).to(tl.bfloat16).to(tl.float32)
 
     total = tl.zeros((BH,), dtype=tl.float32)
     for stream in tl.static_range(S):
         base = (stream * H + h)[:, None].to(tl.int64) * R
-        vec = tl.load(WEIGHT + base + k0[None, :], hm[:, None], other=0.0).to(tl.float32) * x0[None, :]
-        vec += tl.load(WEIGHT + base + (64 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x1[None, :]
-        vec += tl.load(WEIGHT + base + (128 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x2[None, :]
-        vec += tl.load(WEIGHT + base + (192 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x3[None, :]
-        vec += tl.load(WEIGHT + base + (256 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x4[None, :]
-        acc = tl.sum(vec, axis=1)
+        w0 = tl.load(WEIGHT + base + k256[None, :], hm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        w1 = tl.load(WEIGHT + base + (256 + k64)[None, :], hm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        acc = tl.sum(w0 * x0[None, :], axis=1) + tl.sum(w1 * x1[None, :], axis=1)
         gate = tl.sigmoid(acc.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
         val = tl.load(NORM + stream * H + h, hm, other=0.0).to(tl.float32)
         total += (gate * val).to(tl.bfloat16).to(tl.float32)
@@ -454,7 +432,7 @@ def warmup_m1_combine_mix(
     fuse_mlp: bool = False,
 ) -> tuple[tuple[int, int, int], dict, tuple[int, int, int], dict, int]:
     out_rows = 324 if has_next_injection else 320
-    br = 3
+    br = 4
     cn_grid = (triton.cdiv(out_rows, br), 4, 1)
     cn_options = {
         "EPS": float(eps),
@@ -475,8 +453,8 @@ def warmup_m1_combine_mix(
         num_stages=_M1_SPLIT4_DOWN_CONFIG.num_stages,
         **cn_options,
     )
-    gate_grid = (2560 // 2, 1, 1)
-    gate_options = {"H": 2560, "S": 4, "R": 320, "OUT_ROWS": out_rows, "BH": 2}
+    gate_grid = (2560 // 4, 1, 1)
+    gate_options = {"H": 2560, "S": 4, "R": 320, "OUT_ROWS": out_rows, "BH": 4}
     warmup_triton(
         _hc_gate_m1_from_partial.fn,
         (partial, up_weight, normalized, mixed_out, inj_out),

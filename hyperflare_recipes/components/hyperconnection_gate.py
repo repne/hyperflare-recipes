@@ -43,32 +43,21 @@ def _hc_gate_m1_gemv(
     pid = tl.program_id(0)
     h = pid * BH + tl.arange(0, BH)
     hm = h < H
-    k0 = tl.arange(0, 64)
-    r0 = tl.load(PROJ + k0).to(tl.float32)
+    k256 = tl.arange(0, 256)
+    k64 = tl.arange(0, 64)
+    r0 = tl.load(PROJ + k256).to(tl.float32)
     s0 = (r0 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
     x0 = (s0 * tl.sigmoid(s0)).to(tl.bfloat16).to(tl.float32)
-    r1 = tl.load(PROJ + 64 + k0).to(tl.float32)
+    r1 = tl.load(PROJ + 256 + k64).to(tl.float32)
     s1 = (r1 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
     x1 = (s1 * tl.sigmoid(s1)).to(tl.bfloat16).to(tl.float32)
-    r2 = tl.load(PROJ + 128 + k0).to(tl.float32)
-    s2 = (r2 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
-    x2 = (s2 * tl.sigmoid(s2)).to(tl.bfloat16).to(tl.float32)
-    r3 = tl.load(PROJ + 192 + k0).to(tl.float32)
-    s3 = (r3 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
-    x3 = (s3 * tl.sigmoid(s3)).to(tl.bfloat16).to(tl.float32)
-    r4 = tl.load(PROJ + 256 + k0).to(tl.float32)
-    s4 = (r4 * (1.0 / S)).to(tl.bfloat16).to(tl.float32)
-    x4 = (s4 * tl.sigmoid(s4)).to(tl.bfloat16).to(tl.float32)
 
     total = tl.zeros((BH,), dtype=tl.float32)
     for stream in tl.static_range(S):
         base = (stream * H + h)[:, None].to(tl.int64) * R
-        vec = tl.load(WEIGHT + base + k0[None, :], hm[:, None], other=0.0).to(tl.float32) * x0[None, :]
-        vec += tl.load(WEIGHT + base + (64 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x1[None, :]
-        vec += tl.load(WEIGHT + base + (128 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x2[None, :]
-        vec += tl.load(WEIGHT + base + (192 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x3[None, :]
-        vec += tl.load(WEIGHT + base + (256 + k0)[None, :], hm[:, None], other=0.0).to(tl.float32) * x4[None, :]
-        acc = tl.sum(vec, axis=1)
+        w0 = tl.load(WEIGHT + base + k256[None, :], hm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        w1 = tl.load(WEIGHT + base + (256 + k64)[None, :], hm[:, None], other=0.0, cache_modifier=".cs").to(tl.float32)
+        acc = tl.sum(w0 * x0[None, :], axis=1) + tl.sum(w1 * x1[None, :], axis=1)
         gate = tl.sigmoid(acc.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
         val = tl.load(NORM + stream * H + h, hm, other=0.0).to(tl.float32)
         total += (gate * val).to(tl.bfloat16).to(tl.float32)
@@ -299,8 +288,9 @@ class PreparedHyperconnectionGate:
         ):
             self.fuses_scaled_silu = True
             self.implementation = "triton_m1_gemv"
-            self._grid = (hidden // 2, 1, 1)
-            self._options = {"H": hidden, "S": streams, "R": rank, "BH": 2}
+            bh = 4
+            self._grid = (triton.cdiv(hidden, bh), 1, 1)
+            self._options = {"H": hidden, "S": streams, "R": rank, "BH": bh}
             warmup_triton(
                 _hc_gate_m1_gemv.fn,
                 (projected_down, weight, normalized, output),
