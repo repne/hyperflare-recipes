@@ -809,6 +809,123 @@ def test_hc_gate_fused_mxfp8_compiled_parity(tokens):
     assert torch.equal(out_sm, ref_sm)
 
 
+@pytest.mark.parametrize(("tokens", "fuse_mlp", "has_next_inj"), [
+    (4100, False, True),
+    (4100, True, True),
+    (4100, True, False),
+])
+@torch.no_grad()
+def test_tiled_combine_down_silu_compiled_parity(tokens, fuse_mlp, has_next_inj):
+    """Fused tiled combine_norm + down + ScaledSilu matches unfused combine_norm + down + ScaledSilu."""
+    from b12x.norm.hyperconnection import api as hc
+    from b12x.preparation import FrozenMapping, PreparedCall
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.tuning import RecordedPreparationSession, declare
+    from hyperflare_recipes.components.hyperconnection_combine import (
+        launch_combine_norm,
+        launch_tiled_combine_down,
+        supports_tiled_combine_down,
+        warmup_combine_norm,
+        warmup_tiled_combine_down,
+    )
+    from hyperflare_recipes.components.linear import UnquantizedProjection
+
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        pytest.skip("requires SM120/SM121 fused tiled combine_norm + down kernel")
+
+    gen = torch.Generator(device=device).manual_seed(707 + tokens + int(fuse_mlp) * 10 + int(has_next_inj))
+    state = (torch.randn((tokens, 10240), generator=gen, device=device) * 0.2).bfloat16()
+    block = (torch.randn((tokens, 2560), generator=gen, device=device) * 0.2).bfloat16()
+    shared_proj = (torch.randn((tokens, 2560), generator=gen, device=device) * 0.2).bfloat16()
+    packed_router_gate = (torch.randn((tokens, 528), generator=gen, device=device) * 0.2).bfloat16()
+    shared_gate = packed_router_gate[:, 512:513]
+    packed_inj = (torch.randn((tokens, 336), generator=gen, device=device) * 0.2).bfloat16()
+    inj = packed_inj[:, 320:324]
+    gain = (1.0 + torch.randn((10240,), generator=gen, device=device) * 0.05).float()
+    down_rows = 336 if has_next_inj else 320
+    down_w = (torch.randn((down_rows, 10240), generator=gen, device=device) * 0.02).bfloat16()
+
+    assert supports_tiled_combine_down(
+        tokens, tokens, 320, down_w, device, following_fuses_scaled_silu=False,
+    )
+
+    comb_ref_buf = torch.empty_like(state)
+    norm_ref_buf = torch.empty_like(state)
+    down_ref_buf = torch.empty((tokens, down_rows), dtype=torch.bfloat16, device=device)
+    bn_ref_buf = torch.empty((tokens, 320), dtype=torch.bfloat16, device=device)
+    with RecordedPreparationSession(
+        device=device, checkpoint=f"test_tiled_cn_{tokens}_{int(fuse_mlp)}_{int(has_next_inj)}",
+        workload_schema=f"test_tiled_cn_{tokens}_{int(fuse_mlp)}_{int(has_next_inj)}",
+        numerical_policy="default", autotune_effort="off",
+    ) as session:
+        cn_grid, cn_opts = warmup_combine_norm(
+            state, block, inj, gain, comb_ref_buf, norm_ref_buf, eps=1e-6, fuse_mlp=fuse_mlp,
+        )
+        down_proj = UnquantizedProjection(norm_ref_buf, down_w, down_ref_buf, session=session, name="ref.down")
+        caps = hc.Caps(device=device, max_tokens=tokens, hidden_size=2560, streams=4, lowrank=320)
+        silu_plan = hc.plan(caps, invocation=FrozenMapping({"operation": "scaled_silu"}))
+        declare(session, (silu_plan.request(
+            name="ref.silu",
+            prepare_call=lambda st: PreparedCall(run=lambda: st.launch(down_ref_buf[:, :320], bn_ref_buf)),
+        ),))
+        spec = warmup_tiled_combine_down(
+            state, block, inj, gain, down_w, comb_ref_buf, norm_ref_buf, bn_ref_buf,
+            eps=1e-6, has_next_injection=has_next_inj, fuse_mlp=fuse_mlp,
+        )
+        session.tune(show_progress=False)
+
+    ref_comb, ref_norm = launch_combine_norm(
+        state, block, inj, gain, grid=cn_grid, options=cn_opts,
+        shared_projected=shared_proj if fuse_mlp else None,
+        shared_gate=shared_gate if fuse_mlp else None,
+    )
+    down_proj(ref_norm)
+    torch.ops.b12x.hyperconnection_scaled_silu(down_ref_buf[:, :320], bn_ref_buf, silu_plan.handle)
+    ref_inj_out = down_ref_buf[:, 320:324].clone() if has_next_inj else None
+
+    out_comb = torch.empty_like(ref_comb)
+    out_norm = torch.empty_like(ref_norm)
+    out_bn = torch.empty_like(bn_ref_buf)
+    out_inj = torch.empty((tokens, 4), dtype=torch.bfloat16, device=device) if has_next_inj else None
+
+    def run():
+        c, n, bn, n_inj = launch_tiled_combine_down(
+            state, block, inj, gain, down_w, spec=spec,
+            shared_projected=shared_proj if fuse_mlp else None,
+            shared_gate=shared_gate if fuse_mlp else None,
+        )
+        out_comb.copy_(c)
+        out_norm.copy_(n)
+        out_bn.copy_(bn)
+        if has_next_inj:
+            out_inj.copy_(n_inj)
+
+    compiled = compile_forward(run)
+    compiled()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    out_comb.zero_()
+    out_norm.zero_()
+    out_bn.zero_()
+    if has_next_inj:
+        out_inj.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    graph.reset()
+
+    assert torch.equal(out_comb, ref_comb)
+    norm_rel = (out_norm.float() - ref_norm.float()).norm() / ref_norm.float().norm().clamp(min=1e-8)
+    bn_rel = (out_bn.float() - bn_ref_buf.float()).norm() / bn_ref_buf.float().norm().clamp(min=1e-8)
+    assert norm_rel < 1e-4, f"norm_rel={norm_rel}"
+    assert bn_rel < 2e-3, f"bn_rel={bn_rel}"
+    if has_next_inj:
+        inj_rel = (out_inj.float() - ref_inj_out.float()).norm() / ref_inj_out.float().norm().clamp(min=1e-8)
+        assert inj_rel < 2e-3, f"inj_rel={inj_rel}"
+
+
 
 
 

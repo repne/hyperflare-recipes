@@ -16,10 +16,13 @@ from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 from hyperflare_recipes.components.hyperconnection_combine import (
     launch_combine_norm,
     launch_m1_combine_mix,
+    launch_tiled_combine_down,
     supports_m1_combine_mix,
+    supports_tiled_combine_down,
     supports_triton_combine_norm,
     warmup_combine_norm,
     warmup_m1_combine_mix,
+    warmup_tiled_combine_down,
 )
 from hyperflare_recipes.components.hyperconnection_gate import PreparedHyperconnectionGate, PreparedShardedHyperconnectionGate
 from hyperflare_recipes.components.linear import UnquantizedProjection
@@ -225,6 +228,8 @@ class PreparedHyperconnection:
         self._triton_combine_norm_mlp = None
         self._triton_m1_combine_mix = None
         self._triton_m1_combine_mix_mlp = None
+        self._triton_tiled_combine_down = None
+        self._triton_tiled_combine_down_mlp = None
         if supports_m1_combine_mix(
             self.tokens,
             following.tokens,
@@ -250,6 +255,31 @@ class PreparedHyperconnection:
                 self._triton_m1_combine_mix_mlp = spec
             else:
                 self._triton_m1_combine_mix = spec
+        if supports_tiled_combine_down(
+            self.tokens,
+            following.tokens,
+            following.lowrank,
+            following.down.weight,
+            device,
+            following_fuses_scaled_silu=getattr(following.gate, "fuses_scaled_silu", False),
+        ):
+            spec = warmup_tiled_combine_down(
+                priming_state,
+                self.scratch.block_input,
+                self.scratch.injection_logits,
+                following.norm_gain,
+                following.down.weight,
+                self.scratch.gate_workspace,
+                following.scratch.normalized[:self.tokens],
+                following.scratch.bottleneck[:self.tokens],
+                eps=following.eps,
+                has_next_injection=following.injection is not None,
+                fuse_mlp=fuse_mlp,
+            )
+            if fuse_mlp:
+                self._triton_tiled_combine_down_mlp = spec
+            else:
+                self._triton_tiled_combine_down = spec
         if supports_triton_combine_norm(self.tokens, device, fuse_mlp=fuse_mlp):
             if fuse_mlp:
                 self._triton_combine_norm_mlp = warmup_combine_norm(
@@ -341,7 +371,32 @@ class PreparedHyperconnection:
             shared_projected=shared_projected, shared_gate=shared_gate,
         )
 
+    @property
+    def has_combine_mix(self) -> bool:
+        return (
+            getattr(self, "_triton_m1_combine_mix", None) is not None
+            or getattr(self, "_triton_tiled_combine_down", None) is not None
+        )
+
+    @property
+    def has_combine_mix_mlp(self) -> bool:
+        return (
+            getattr(self, "_triton_m1_combine_mix_mlp", None) is not None
+            or getattr(self, "_triton_tiled_combine_down_mlp", None) is not None
+        )
+
     def combine_mix_runtime(self, residual, block_output, injection):
+        tiled = getattr(self, "_triton_tiled_combine_down", None)
+        if tiled is not None:
+            combined, normalized, bottleneck, next_injection = launch_tiled_combine_down(
+                residual,
+                block_output,
+                injection,
+                self.following.norm_gain,
+                self.following.down.weight,
+                spec=tiled,
+            )
+            return combined, self.following.gate(bottleneck, normalized), next_injection
         return launch_m1_combine_mix(
             residual,
             block_output,
@@ -353,6 +408,19 @@ class PreparedHyperconnection:
         )
 
     def combine_mix_mlp_runtime(self, residual, routed, shared_projected, shared_gate, injection):
+        tiled = getattr(self, "_triton_tiled_combine_down_mlp", None)
+        if tiled is not None:
+            combined, normalized, bottleneck, next_injection = launch_tiled_combine_down(
+                residual,
+                routed,
+                injection,
+                self.following.norm_gain,
+                self.following.down.weight,
+                spec=tiled,
+                shared_projected=shared_projected,
+                shared_gate=shared_gate,
+            )
+            return combined, self.following.gate(bottleneck, normalized), next_injection
         return launch_m1_combine_mix(
             residual,
             routed,

@@ -1683,8 +1683,12 @@ class PreparedDecoder:
                         normalized = None
                     prefetched_mix = None
                 if prefetched_mix is not None:
-                    mixed, injection = prefetched_mix
-                    enc_bases = None
+                    if attn_hc.emits_mxfp8:
+                        enc_bases, injection = prefetched_mix
+                        mixed = enc_bases[0]
+                    else:
+                        mixed, injection = prefetched_mix
+                        enc_bases = None
                     prefetched_mix = None
                 else:
                     mixed, enc_bases, injection = self._mix_attn_input(attn_hc, residual, normalized)
@@ -1701,7 +1705,7 @@ class PreparedDecoder:
                     block = attention(mixed, runtime.qsa, input_encoded_bases=enc_bases)
                 if self.reductions:
                     block = self.reductions[index][0](block)
-                if getattr(attn_hc, "_triton_m1_combine_mix", None) is not None:
+                if attn_hc.has_combine_mix:
                     residual, mixed, injection = attn_hc.combine_mix_runtime(residual, block, injection)
                     normalized = None
                 else:
@@ -1713,14 +1717,14 @@ class PreparedDecoder:
                         block = self.reductions[index][1](block)
                     residual = mlp_hc.combine_runtime(residual, block, injection)
                     normalized = None
-                elif not self.reductions and getattr(mlp_hc, "_triton_m1_combine_mix_mlp", None) is not None:
+                elif not self.reductions and mlp_hc.has_combine_mix_mlp:
                     routed, shared_proj, shared_gate = moe.parts_runtime(mixed)
                     residual, next_mixed, next_inj = mlp_hc.combine_mix_mlp_runtime(
                         residual, routed, shared_proj, shared_gate, injection,
                     )
                     normalized = None
                     prefetched_mix = (next_mixed, next_inj)
-                elif getattr(mlp_hc, "_triton_m1_combine_mix", None) is not None:
+                elif mlp_hc.has_combine_mix:
                     block = moe(mixed)
                     if self.reductions:
                         block = self.reductions[index][1](block)
